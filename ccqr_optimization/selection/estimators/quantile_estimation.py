@@ -44,6 +44,7 @@ class BaseMultiFitQuantileEstimator(ABC):
         Returns:
             Self for method chaining.
         """
+        self.quantiles = quantiles
         self.trained_estimators = []
         for quantile in quantiles:
             quantile_estimator = self._fit_quantile_estimator(X, y, quantile)
@@ -81,7 +82,17 @@ class BaseMultiFitQuantileEstimator(ABC):
         y_pred = np.column_stack(
             [estimator.predict(X) for estimator in self.trained_estimators]
         )
-        return y_pred
+        
+        # Apply rearrangement method (Chernozhukov et al., 2010) to prevent quantile crossing.
+        # This pointwise sorting guarantees monotonicity and reduces estimation error.
+        y_pred_sorted = np.sort(y_pred, axis=1)
+        
+        # Map sorted predictions back to the originally requested quantile order
+        sorted_idx = np.argsort(self.quantiles)
+        reverse_idx = np.empty_like(sorted_idx)
+        reverse_idx[sorted_idx] = np.arange(len(self.quantiles))
+        
+        return y_pred_sorted[:, reverse_idx]
 
 
 class BaseSingleFitQuantileEstimator(ABC):

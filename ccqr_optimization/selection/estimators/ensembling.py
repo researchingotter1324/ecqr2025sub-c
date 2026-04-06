@@ -386,7 +386,17 @@ class QuantileEnsembleEstimator(BaseEnsembleEstimator):
             ]  # Shape: (n_estimators, n_samples)
             ensemble_predictions[:, q_idx] = np.dot(quantile_weights, quantile_preds)
 
-        return ensemble_predictions
+        # NOTE: Apply rearrangement method (Chernozhukov et al.) to prevent quantile crossing.
+        # Ensemble weights are optimized per-quantile, which can introduce crossing even
+        # if base estimators are monotonic.
+        ensemble_predictions_sorted = np.sort(ensemble_predictions, axis=1)
+        
+        # Map sorted predictions back to the originally requested quantile order
+        sorted_idx = np.argsort(self.quantiles)
+        reverse_idx = np.empty_like(sorted_idx)
+        reverse_idx[sorted_idx] = np.arange(len(self.quantiles))
+        
+        return ensemble_predictions_sorted[:, reverse_idx]
 
 
 class PointEnsembleEstimator(BaseEnsembleEstimator):
