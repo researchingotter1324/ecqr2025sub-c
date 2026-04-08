@@ -22,6 +22,11 @@ from ccqr_optimization.selection.acquisition import (
     PessimisticLowerBoundSampler,
     BaseConformalSearcher,
 )
+from ccqr_optimization.selection.sampling.expected_improvement_samplers import (
+    ExpectedImprovementSampler,
+)
+from ccqr_optimization.selection.sampling.local_search import LocalSearchOptimizer
+from ccqr_optimization.utils.configurations.utils import create_config_hash
 
 logger = logging.getLogger(__name__)
 
@@ -410,31 +415,100 @@ class ConformalTuner:
         training_runtime = runtime_tracker.return_runtime()
         return training_runtime
 
+    def _select_next_via_expected_improvement_local_search(
+        self,
+        searcher: BaseConformalSearcher,
+        searchable_configs: List[Dict],
+        acquisition_values: np.ndarray,
+        local_search_iterations: int,
+        previous_configs_to_use: int,
+    ) -> Dict:
+        """Refine acquisition on pooled candidates with local search; return best config.
+
+        Takes the top candidates from the current random pool and from previously
+        evaluated configurations, deduplicates them, and runs ``LocalSearchOptimizer``
+        to approximate the minimizer of the acquisition surface (EI returns values
+        where lower is better).
+
+        Args:
+            searcher: Fitted conformal searcher (Expected Improvement sampler).
+            searchable_configs: Configurations aligned with ``acquisition_values`` rows.
+            acquisition_values: Acquisition scores for each searchable config, shape (n,).
+            local_search_iterations: How many top random-pool configs seed local search.
+            previous_configs_to_use: How many top historical configs seed local search.
+
+        Returns:
+            Configuration selected after local search.
+        """
+        top_indices = np.argsort(acquisition_values)[:local_search_iterations]
+        top_random_configs = [searchable_configs[i] for i in top_indices]
+
+        previous_configs = self.config_manager.searched_configs
+        if len(previous_configs) > 0:
+            prev_transformed = self.config_manager.tabularize_configs(
+                previous_configs
+            )
+            prev_acq = searcher.predict(X=prev_transformed)
+            top_prev_indices = np.argsort(prev_acq)[:previous_configs_to_use]
+            top_prev_configs = [previous_configs[i] for i in top_prev_indices]
+        else:
+            top_prev_configs = []
+
+        starting_points = []
+        seen_hashes = set()
+        for config in top_random_configs + top_prev_configs:
+            chash = create_config_hash(config)
+            if chash not in seen_hashes:
+                seen_hashes.add(chash)
+                starting_points.append(config)
+
+        local_optimizer = LocalSearchOptimizer(
+            search_space=self.search_space,
+            config_manager=self.config_manager,
+        )
+        return local_optimizer.maximize(
+            searcher=searcher,
+            starting_points=starting_points,
+        )
+
     def select_next_configuration(
         self,
         searcher: BaseConformalSearcher,
         searchable_configs: List,
         transformed_configs: np.array,
+        local_search_iterations: int = 18,
+        previous_configs_to_use: int = 14,
     ) -> Dict:
-        """Select the most promising configuration using conformal predictions.
+        """Select the most promising configuration using conformal predictions and local search.
 
         Uses the conformal searcher to predict lower bounds for all available
-        configurations and selects the one with the minimum predicted lower bound.
-        This implements a pessimistic acquisition strategy that favors configurations
-        with high confidence of good performance.
+        configurations. If using Expected Improvement, refines the top candidates 
+        using a vectorized local search to find the true minimum of the acquisition function.
+        Otherwise, returns the best configuration from the initial pool.
 
         Args:
             searcher: Trained conformal searcher for predictions
             searchable_configs: List of available configuration dictionaries
             transformed_configs: Scaled feature matrix for configurations
+            local_search_iterations: Top acquisition points from the candidate pool to seed local search
+            previous_configs_to_use: Top acquisition points from evaluated history to seed local search
 
         Returns:
             Selected configuration dictionary
         """
         bounds = searcher.predict(X=transformed_configs)
-        next_idx = np.argmin(bounds)
-        next_config = searchable_configs[next_idx]
-        return next_config
+
+        if isinstance(searcher.sampler, ExpectedImprovementSampler):
+            return self._select_next_via_expected_improvement_local_search(
+                searcher=searcher,
+                searchable_configs=searchable_configs,
+                acquisition_values=bounds,
+                local_search_iterations=local_search_iterations,
+                previous_configs_to_use=previous_configs_to_use,
+            )
+        else:
+            next_idx = np.argmin(bounds)
+            return searchable_configs[next_idx]
 
     def get_interval_if_applicable(
         self,

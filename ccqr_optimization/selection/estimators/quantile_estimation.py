@@ -83,7 +83,7 @@ class BaseMultiFitQuantileEstimator(ABC):
             [estimator.predict(X) for estimator in self.trained_estimators]
         )
         
-        # Apply rearrangement method (Chernozhukov et al., 2010) to prevent quantile crossing.
+        # NOTE: Apply rearrangement method (Chernozhukov et al.) to prevent quantile crossing.
         # This pointwise sorting guarantees monotonicity and reduces estimation error.
         y_pred_sorted = np.sort(y_pred, axis=1)
         
