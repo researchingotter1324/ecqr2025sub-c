@@ -26,7 +26,6 @@ from ccqr_optimization.selection.sampling.expected_improvement_samplers import (
     ExpectedImprovementSampler,
 )
 from ccqr_optimization.selection.sampling.local_search import LocalSearchOptimizer
-from ccqr_optimization.utils.configurations.utils import create_config_hash
 
 logger = logging.getLogger(__name__)
 
@@ -426,9 +425,9 @@ class ConformalTuner:
         """Refine acquisition on pooled candidates with local search; return best config.
 
         Takes the top candidates from the current random pool and from previously
-        evaluated configurations, deduplicates them, and runs ``LocalSearchOptimizer``
-        to approximate the minimizer of the acquisition surface (EI returns values
-        where lower is better).
+        evaluated configurations, and passes them to the LocalSearchOptimizer which
+        will filter them for diversity using Non-Maximum Suppression and run 
+        adaptive pattern searches.
 
         Args:
             searcher: Fitted conformal searcher (Expected Improvement sampler).
@@ -442,6 +441,7 @@ class ConformalTuner:
         """
         top_indices = np.argsort(acquisition_values)[:local_search_iterations]
         top_random_configs = [searchable_configs[i] for i in top_indices]
+        top_random_scores = acquisition_values[top_indices]
 
         previous_configs = self.config_manager.searched_configs
         if len(previous_configs) > 0:
@@ -451,16 +451,13 @@ class ConformalTuner:
             prev_acq = searcher.predict(X=prev_transformed)
             top_prev_indices = np.argsort(prev_acq)[:previous_configs_to_use]
             top_prev_configs = [previous_configs[i] for i in top_prev_indices]
+            top_prev_scores = prev_acq[top_prev_indices]
         else:
             top_prev_configs = []
+            top_prev_scores = np.array([])
 
-        starting_points = []
-        seen_hashes = set()
-        for config in top_random_configs + top_prev_configs:
-            chash = create_config_hash(config)
-            if chash not in seen_hashes:
-                seen_hashes.add(chash)
-                starting_points.append(config)
+        candidate_configs = top_random_configs + top_prev_configs
+        candidate_scores = np.concatenate([top_random_scores, top_prev_scores])
 
         local_optimizer = LocalSearchOptimizer(
             search_space=self.search_space,
@@ -468,7 +465,8 @@ class ConformalTuner:
         )
         return local_optimizer.maximize(
             searcher=searcher,
-            starting_points=starting_points,
+            candidate_configs=candidate_configs,
+            candidate_scores=candidate_scores,
         )
 
     def select_next_configuration(
@@ -476,15 +474,15 @@ class ConformalTuner:
         searcher: BaseConformalSearcher,
         searchable_configs: List,
         transformed_configs: np.array,
-        local_search_iterations: int = 18,
-        previous_configs_to_use: int = 14,
+        local_search_iterations: int = 10,
+        previous_configs_to_use: int = 6,
     ) -> Dict:
-        """Select the most promising configuration using conformal predictions and local search.
+        """Select the most promising configuration using conformal predictions.
 
-        Uses the conformal searcher to predict lower bounds for all available
-        configurations. If using Expected Improvement, refines the top candidates 
-        using a vectorized local search to find the true minimum of the acquisition function.
-        Otherwise, returns the best configuration from the initial pool.
+        Uses the conformal searcher to score all searchable configurations in the current
+        pool. For Expected Improvement with ``sampler.use_local_search`` True, runs local
+        search on top candidates; otherwise (or for other samplers), returns the
+        configuration with best (minimum) acquisition in that pool.
 
         Args:
             searcher: Trained conformal searcher for predictions
@@ -498,7 +496,10 @@ class ConformalTuner:
         """
         bounds = searcher.predict(X=transformed_configs)
 
-        if isinstance(searcher.sampler, ExpectedImprovementSampler):
+        if (
+            isinstance(searcher.sampler, ExpectedImprovementSampler)
+            and searcher.sampler.use_local_search
+        ):
             return self._select_next_via_expected_improvement_local_search(
                 searcher=searcher,
                 searchable_configs=searchable_configs,
@@ -506,9 +507,8 @@ class ConformalTuner:
                 local_search_iterations=local_search_iterations,
                 previous_configs_to_use=previous_configs_to_use,
             )
-        else:
-            next_idx = np.argmin(bounds)
-            return searchable_configs[next_idx]
+        next_idx = int(np.argmin(bounds))
+        return searchable_configs[next_idx]
 
     def get_interval_if_applicable(
         self,

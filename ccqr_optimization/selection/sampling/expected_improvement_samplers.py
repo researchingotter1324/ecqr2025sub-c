@@ -69,6 +69,7 @@ class ExpectedImprovementSampler:
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
         current_best_value: float = float("inf"),
         num_ei_samples: int = 20,
+        use_local_search: bool = True,
     ):
         """
         Initialize Expected Improvement sampler with interval construction.
@@ -86,12 +87,17 @@ class ExpectedImprovementSampler:
             num_ei_samples: Number of Monte Carlo samples for EI estimation.
                 Higher values provide more accurate estimates but increase
                 computational cost. Typical values: 10-50.
+            use_local_search: When True (default), the conformal tuning loop may run
+                a local search refiner on the acquisition surface after scoring the
+                candidate pool. When False, selection uses the best-scoring point
+                in that pool only (no extra surrogate predictions for local search).
         """
         validate_even_quantiles(n_quantiles, "Expected Improvement")
 
         self.n_quantiles = n_quantiles
         self.current_best_value = current_best_value
         self.num_ei_samples = num_ei_samples
+        self.use_local_search = use_local_search
 
         # Initialize symmetric quantile-based alpha values
         self.alphas = initialize_quantile_alphas(n_quantiles)
