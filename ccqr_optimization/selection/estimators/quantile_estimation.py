@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from scipy.stats import norm
 from scipy.linalg import solve_triangular, cholesky, LinAlgError
 from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process.kernels import (
     RBF,
     Matern,
@@ -24,6 +25,7 @@ from sklearn.gaussian_process.kernels import (
     ExpSineSquared,
     ConstantKernel as C,
     Kernel,
+    WhiteKernel,
 )
 import warnings
 import copy
@@ -580,6 +582,8 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
 
         # Fitted attributes
         self.X_train_ = None
+        self.X_train_mean_ = None
+        self.X_train_std_ = None
         self.y_train_ = None
         self.kernel_ = None
         self.noise_variance_ = None
@@ -681,14 +685,17 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         # If noise_variance is "optimize", use a small alpha and let GP optimize noise
         # If noise_variance is fixed, use it as alpha
         if self.noise_variance == "optimize":
-            alpha_for_opt = self.alpha  # Small regularization only
+            # We use a small fixed alpha for numerical stability, WhiteKernel handles the actual noise
+            kernel_to_fit = self.kernel_ + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-5, 1e1))
+            alpha_for_opt = max(self.alpha, 1e-6)
         else:
+            kernel_to_fit = self.kernel_
             alpha_for_opt = self.noise_variance_ + self.alpha
 
         # Use sklearn's GaussianProcessRegressor for hyperparameter optimization
         # This provides robust optimization with proper parameter mapping
         temp_gp = GaussianProcessRegressor(
-            kernel=self.kernel_,
+            kernel=kernel_to_fit,
             alpha=alpha_for_opt,
             n_restarts_optimizer=self.n_restarts_optimizer,
             random_state=self.random_state,
@@ -704,15 +711,20 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
                     category=UserWarning,
                     module="sklearn.gaussian_process.kernels",
                 )
+                warnings.filterwarnings(
+                    "ignore",
+                    category=ConvergenceWarning,
+                )
                 temp_gp.fit(self.X_train_, self.y_train_)
+            
             # Extract optimized kernel
-            self.kernel_ = temp_gp.kernel_
-
-            # Extract optimized noise variance if it was being optimized
             if self.noise_variance == "optimize":
-                # sklearn's alpha includes both noise and regularization
-                # Extract the optimized noise component
-                self.noise_variance_ = max(temp_gp.alpha - self.alpha, 1e-10)
+                # temp_gp.kernel_ is a Sum(base_kernel, WhiteKernel)
+                # Extract the optimized base kernel and the optimized noise level
+                self.kernel_ = temp_gp.kernel_.k1
+                self.noise_variance_ = temp_gp.kernel_.k2.noise_level
+            else:
+                self.kernel_ = temp_gp.kernel_
 
         except Exception as e:
             logging.warning(
@@ -735,8 +747,12 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         Returns:
             Self for method chaining.
         """
-        # Store training data
-        self.X_train_ = X.copy()
+        # Normalize features
+        self.X_train_mean_ = np.mean(X, axis=0)
+        self.X_train_std_ = np.std(X, axis=0)
+        # Handle constant features
+        self.X_train_std_[self.X_train_std_ < 1e-12] = 1.0
+        self.X_train_ = (X - self.X_train_mean_) / self.X_train_std_
 
         # Normalize targets
         self.y_train_mean_ = np.mean(y)
@@ -749,9 +765,11 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         n_features = X.shape[1]
         self.kernel_ = self._get_kernel_object(self.kernel, n_features)
 
-        # Set noise variance
+        # Set noise variance in normalized target space.
+        # The kernel matrix is built on normalized targets (zero-mean, unit-variance),
+        # so noise variance must be converted to the same normalized scale.
         if isinstance(self.noise_variance, (int, float)):
-            self.noise_variance_ = self.noise_variance
+            self.noise_variance_ = self.noise_variance / self.y_train_std_**2
         else:
             self.noise_variance_ = 1e-6  # Default, will be optimized if needed
 
@@ -793,8 +811,9 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
                     return
                 continue
 
-        # Solve for alpha using Cholesky decomposition
-        self.alpha_ = solve_triangular(self.chol_factor_, self.y_train_, lower=True)
+        # Solve for alpha = K^-1 y using Cholesky decomposition
+        L_inv_y = solve_triangular(self.chol_factor_, self.y_train_, lower=True)
+        self.alpha_ = solve_triangular(self.chol_factor_.T, L_inv_y, lower=False)
 
     def _fit_gp_eigendecomp(self, K: np.ndarray) -> None:
         """Fallback GP fitting using eigendecomposition for ill-conditioned matrices."""
@@ -803,9 +822,6 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
 
         # Clip negative eigenvalues and add regularization
         eigenvals = np.maximum(eigenvals, 1e-12)
-
-        # Reconstruct with regularized eigenvalues
-        eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
 
         # Use pseudo-inverse for fitting
         try:
@@ -870,16 +886,19 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         Returns:
             Tuple of (y_mean, y_var) with shapes (n_samples,) each.
         """
+        # Normalize test features
+        X_norm = (X - self.X_train_mean_) / self.X_train_std_
+
         # Compute kernel between test and training points
-        K_star = self.kernel_(X, self.X_train_)
+        K_star = self.kernel_(X_norm, self.X_train_)
 
         if self.chol_factor_ is not None:
             # Use Cholesky-based computation
-            chol_solve = solve_triangular(self.chol_factor_, K_star.T, lower=True)
-            y_mean = chol_solve.T @ self.alpha_
+            y_mean = K_star @ self.alpha_
 
             # Compute variance (in normalized space)
-            K_star_star = self.kernel_.diag(X)
+            chol_solve = solve_triangular(self.chol_factor_, K_star.T, lower=True)
+            K_star_star = self.kernel_.diag(X_norm)
             y_var = K_star_star - np.sum(chol_solve**2, axis=0)
 
         else:
@@ -887,12 +906,11 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
             y_mean = K_star @ self.alpha_
 
             # Compute variance using eigendecomposition
-            K_star_star = self.kernel_.diag(X)
-            # K^{-1} = V * Λ^{-1} * V^T
+            K_star_star = self.kernel_.diag(X_norm)
+            # K^{-1} K_*^T = V * Λ^{-1} * V^T * K_*^T
             K_inv_K_star = (
                 self.eigenvecs_
-                @ (K_star.T / self.eigenvals_.reshape(-1, 1))
-                @ self.eigenvecs_.T
+                @ ((self.eigenvecs_.T @ K_star.T) / self.eigenvals_.reshape(-1, 1))
             )
             y_var = K_star_star - np.sum(K_star * K_inv_K_star.T, axis=1)
 
