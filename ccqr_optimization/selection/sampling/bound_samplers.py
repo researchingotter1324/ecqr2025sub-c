@@ -56,6 +56,7 @@ class PessimisticLowerBoundSampler:
         self,
         interval_width: float = 0.8,
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
+        use_local_search: bool = True,
     ):
         """
         Initialize pessimistic lower bound sampler with specified confidence level.
@@ -67,10 +68,15 @@ class PessimisticLowerBoundSampler:
             adapter: Interval width adaptation strategy. "DtACI" provides
                 aggressive multi-scale adaptation, "ACI" offers conservative
                 adaptation, None disables adaptation.
+            use_local_search: When True (default), the conformal tuning loop may run
+                a local search refiner on the acquisition surface after scoring the
+                candidate pool. When False, selection uses the best-scoring point
+                in that pool only (no extra surrogate predictions for local search).
         """
         self.interval_width = interval_width
         self.alpha = 1 - interval_width
         self.adapter = initialize_single_adapter(self.alpha, adapter)
+        self.use_local_search = use_local_search
 
     def fetch_alphas(self) -> List[float]:
         """
@@ -130,6 +136,7 @@ class LowerBoundSampler(PessimisticLowerBoundSampler):
         ] = "logarithmic_decay",
         c: float = 1,
         beta_max: float = 10,
+        use_local_search: bool = True,
     ):
         """
         Initialize LCB sampler with exploration decay schedule.
@@ -148,8 +155,12 @@ class LowerBoundSampler(PessimisticLowerBoundSampler):
             beta_max: Maximum exploration parameter value to prevent excessive
                 exploration in early iterations. Provides stability for the
                 acquisition function.
+            use_local_search: When True (default), the conformal tuning loop may run
+                a local search refiner on the acquisition surface after scoring the
+                candidate pool. When False, selection uses the best-scoring point
+                in that pool only (no extra surrogate predictions for local search).
         """
-        super().__init__(interval_width, adapter)
+        super().__init__(interval_width, adapter, use_local_search)
         self.beta_decay = beta_decay
         self.c = c
         self.t = 1  # Time step counter for decay computation

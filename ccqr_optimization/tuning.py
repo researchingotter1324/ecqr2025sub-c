@@ -414,7 +414,7 @@ class ConformalTuner:
         training_runtime = runtime_tracker.return_runtime()
         return training_runtime
 
-    def _select_next_via_expected_improvement_local_search(
+    def _select_next_via_local_search(
         self,
         searcher: BaseConformalSearcher,
         searchable_configs: List[Dict],
@@ -426,11 +426,13 @@ class ConformalTuner:
 
         Takes the top candidates from the current random pool and from previously
         evaluated configurations, and passes them to the LocalSearchOptimizer which
-        will filter them for diversity using Non-Maximum Suppression and run 
-        adaptive pattern searches.
+        will filter them for diversity using Non-Maximum Suppression and run
+        adaptive pattern searches. Works with any sampler that exposes a
+        ``use_local_search`` flag (ExpectedImprovementSampler, PessimisticLowerBoundSampler,
+        LowerBoundSampler).
 
         Args:
-            searcher: Fitted conformal searcher (Expected Improvement sampler).
+            searcher: Fitted conformal searcher whose sampler has ``use_local_search=True``.
             searchable_configs: Configurations aligned with ``acquisition_values`` rows.
             acquisition_values: Acquisition scores for each searchable config, shape (n,).
             local_search_iterations: How many top random-pool configs seed local search.
@@ -480,9 +482,11 @@ class ConformalTuner:
         """Select the most promising configuration using conformal predictions.
 
         Uses the conformal searcher to score all searchable configurations in the current
-        pool. For Expected Improvement with ``sampler.use_local_search`` True, runs local
-        search on top candidates; otherwise (or for other samplers), returns the
-        configuration with best (minimum) acquisition in that pool.
+        pool. When the sampler has ``use_local_search=True`` (supported by
+        ExpectedImprovementSampler, PessimisticLowerBoundSampler, and LowerBoundSampler),
+        runs local search on top candidates to maximize the acquisition surface beyond
+        the initial random pool. Otherwise returns the configuration with the best
+        (minimum) acquisition score in that pool directly.
 
         Args:
             searcher: Trained conformal searcher for predictions
@@ -496,19 +500,19 @@ class ConformalTuner:
         """
         bounds = searcher.predict(X=transformed_configs)
 
-        if (
-            isinstance(searcher.sampler, ExpectedImprovementSampler)
-            and searcher.sampler.use_local_search
-        ):
-            return self._select_next_via_expected_improvement_local_search(
+        if hasattr(searcher.sampler, "use_local_search") and searcher.sampler.use_local_search:
+            selected = self._select_next_via_local_search(
                 searcher=searcher,
                 searchable_configs=searchable_configs,
                 acquisition_values=bounds,
                 local_search_iterations=local_search_iterations,
                 previous_configs_to_use=previous_configs_to_use,
             )
-        next_idx = int(np.argmin(bounds))
-        return searchable_configs[next_idx]
+        else:
+            next_idx = int(np.argmin(bounds))
+            selected = searchable_configs[next_idx]
+
+        return selected
 
     def get_interval_if_applicable(
         self,
