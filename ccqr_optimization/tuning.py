@@ -418,57 +418,39 @@ class ConformalTuner:
         self,
         searcher: BaseConformalSearcher,
         searchable_configs: List[Dict],
-        acquisition_values: np.ndarray,
         local_search_iterations: int,
         previous_configs_to_use: int,
     ) -> Dict:
-        """Refine acquisition on pooled candidates with local search; return best config.
+        """Refine acquisition on the random candidate pool with local search; return best config.
 
-        Takes the top candidates from the current random pool and from previously
-        evaluated configurations, and passes them to the LocalSearchOptimizer which
-        will filter them for diversity using Non-Maximum Suppression and run
-        adaptive pattern searches. Works with any sampler that exposes a
-        ``use_local_search`` flag (ExpectedImprovementSampler, PessimisticLowerBoundSampler,
-        LowerBoundSampler).
+        Passes the full searchable pool to LocalSearchOptimizer, which scores it internally
+        to establish a baseline, selects diverse epicenters from both the random pool and the
+        evaluated history, and runs a per-epicenter stochastic perturbation search.
+
+        Works with any sampler that exposes a ``use_local_search`` flag
+        (ExpectedImprovementSampler, PessimisticLowerBoundSampler, LowerBoundSampler).
+
+        All acquisition scoring uses the codebase-native lower-is-better convention.
 
         Args:
             searcher: Fitted conformal searcher whose sampler has ``use_local_search=True``.
-            searchable_configs: Configurations aligned with ``acquisition_values`` rows.
-            acquisition_values: Acquisition scores for each searchable config, shape (n,).
-            local_search_iterations: How many top random-pool configs seed local search.
-            previous_configs_to_use: How many top historical configs seed local search.
+            searchable_configs: Full random candidate pool for this iteration.
+            local_search_iterations: Passed as n_acq_epicenters to LocalSearchOptimizer.
+            previous_configs_to_use: Passed as n_historical_epicenters to LocalSearchOptimizer.
 
         Returns:
             Configuration selected after local search.
         """
-        top_indices = np.argsort(acquisition_values)[:local_search_iterations]
-        top_random_configs = [searchable_configs[i] for i in top_indices]
-        top_random_scores = acquisition_values[top_indices]
-
-        previous_configs = self.config_manager.searched_configs
-        if len(previous_configs) > 0:
-            prev_transformed = self.config_manager.tabularize_configs(
-                previous_configs
-            )
-            prev_acq = searcher.predict(X=prev_transformed)
-            top_prev_indices = np.argsort(prev_acq)[:previous_configs_to_use]
-            top_prev_configs = [previous_configs[i] for i in top_prev_indices]
-            top_prev_scores = prev_acq[top_prev_indices]
-        else:
-            top_prev_configs = []
-            top_prev_scores = np.array([])
-
-        candidate_configs = top_random_configs + top_prev_configs
-        candidate_scores = np.concatenate([top_random_scores, top_prev_scores])
-
         local_optimizer = LocalSearchOptimizer(
             search_space=self.search_space,
             config_manager=self.config_manager,
+            metric_sign=self.metric_sign,
+            n_historical_epicenters=previous_configs_to_use,
+            n_acq_epicenters=local_search_iterations,
         )
-        return local_optimizer.maximize(
+        return local_optimizer.select_next(
             searcher=searcher,
-            candidate_configs=candidate_configs,
-            candidate_scores=candidate_scores,
+            candidates=searchable_configs,
         )
 
     def select_next_configuration(
@@ -484,31 +466,34 @@ class ConformalTuner:
         Uses the conformal searcher to score all searchable configurations in the current
         pool. When the sampler has ``use_local_search=True`` (supported by
         ExpectedImprovementSampler, PessimisticLowerBoundSampler, and LowerBoundSampler),
-        runs local search on top candidates to maximize the acquisition surface beyond
-        the initial random pool. Otherwise returns the configuration with the best
-        (minimum) acquisition score in that pool directly.
+        runs local search on top candidates to maximize the acquisition surface beyond the
+        initial random pool. In the local search path, ``transformed_configs`` is not used
+        because the optimizer performs its own internal scoring.
+        Otherwise returns the configuration with the best (minimum) acquisition score in
+        that pool directly.
 
         Args:
             searcher: Trained conformal searcher for predictions
             searchable_configs: List of available configuration dictionaries
-            transformed_configs: Scaled feature matrix for configurations
+            transformed_configs: Scaled feature matrix for configurations; used only in the
+                non-local-search path.
             local_search_iterations: Top acquisition points from the candidate pool to seed local search
             previous_configs_to_use: Top acquisition points from evaluated history to seed local search
 
         Returns:
             Selected configuration dictionary
         """
-        bounds = searcher.predict(X=transformed_configs)
-
         if hasattr(searcher.sampler, "use_local_search") and searcher.sampler.use_local_search:
+            # LocalSearchOptimizer scores the pool itself (Phase 0) so we skip the
+            # full-pool predict call here to avoid a redundant and expensive batch evaluation.
             selected = self._select_next_via_local_search(
                 searcher=searcher,
                 searchable_configs=searchable_configs,
-                acquisition_values=bounds,
                 local_search_iterations=local_search_iterations,
                 previous_configs_to_use=previous_configs_to_use,
             )
         else:
+            bounds = searcher.predict(X=transformed_configs)
             next_idx = int(np.argmin(bounds))
             selected = searchable_configs[next_idx]
 
