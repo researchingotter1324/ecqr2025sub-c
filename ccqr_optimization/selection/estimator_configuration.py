@@ -15,7 +15,7 @@ from ccqr_optimization.selection.estimators.quantile_estimation import (
     QuantileKNN,
     QuantileLasso,
     QuantileGP,
-    QuantileLeaf,  # Added QuantileLeaf to imports
+    QuantileLeaf,
 )
 from ccqr_optimization.wrapping import ParameterRange
 from ccqr_optimization.selection.estimators.ensembling import (
@@ -60,7 +60,7 @@ RF_NAME: str = "rf"
 QKNN_NAME: str = "qknn"
 QL_NAME: str = "ql"
 QGP_NAME: str = "qgp"  # Gaussian Process Quantile Estimator
-QLEAF_NAME: str = "qleaf"  # New quantile estimator
+QLEAF_NAME: str = "qleaf"
 
 # New ensemble estimator names
 QENS1_NAME: str = "qens1"  # Ensemble of QL + QKNN + QRF

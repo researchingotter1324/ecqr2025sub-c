@@ -7,9 +7,10 @@ random forest, neural network, and Gaussian process variants optimized for uncer
 quantification in conformal prediction frameworks.
 """
 
-from typing import List, Union, Optional
+from typing import Dict, List, Union, Optional
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble._forest import _generate_sample_indices, _get_n_samples_bootstrap
 from sklearn.neighbors import NearestNeighbors
 from statsmodels.regression.quantile_regression import QuantReg
 from sklearn.base import clone
@@ -442,15 +443,26 @@ class QuantileForest(BaseSingleFitQuantileEstimator):
     def _get_candidate_local_distribution(self, X: np.ndarray) -> np.ndarray:
         """Extract tree prediction distributions for quantile computation.
 
+        Uses apply() to obtain leaf assignments and then looks up each tree's
+        stored leaf mean in a single vectorised pass, avoiding the O(n_trees)
+        Python-loop overhead of calling individual estimator.predict() per tree.
+
         Args:
             X: Features with shape (n_samples, n_features).
 
         Returns:
             Tree predictions with shape (n_samples, n_estimators).
         """
-        sub_preds = np.column_stack(
-            [estimator.predict(X) for estimator in self.fitted_model.estimators_]
-        )
+        # apply() returns (n_samples, n_estimators) leaf node ids in one batched call
+        leaf_ids = self.fitted_model.apply(X)  # (n_samples, n_trees)
+        n_samples, n_trees = leaf_ids.shape
+
+        sub_preds = np.empty((n_samples, n_trees), dtype=np.float64)
+        for b, estimator in enumerate(self.fitted_model.estimators_):
+            # tree_.value has shape (n_nodes, n_outputs, max_n_classes);
+            # index with leaf ids to get the stored mean for each sample
+            sub_preds[:, b] = estimator.tree_.value[leaf_ids[:, b], 0, 0]
+
         return sub_preds
 
 
@@ -967,28 +979,33 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
 
 
 class QuantileLeaf(BaseSingleFitQuantileEstimator):
-    """Quantile Regression Forest using raw Y values from leaf nodes (Meinshausen 2006).
+    """Quantile Regression Forest via leaf-weighted empirical CDF (Meinshausen 2006).
 
-    Implements quantile regression following the approach in Meinshausen (2006) where
-    quantiles are computed from the empirical distribution of all raw Y training values
-    that fall into the same leaf nodes as the prediction point across all trees.
+    Each training sample receives a proximity weight relative to a test point x:
 
-    For a prediction point x, the method collects all training targets Y_i where
-    training point X_i and prediction point x end up in the same leaf node across
-    all trees in the forest. Quantiles are then computed as empirical percentiles
-    of this combined set of Y values.
+        w_i(x) = (1/B) * sum_b [ 1(X_i in L_b(x)) / |L_b(x)| ]
 
-    This approach differs from standard random forest quantiles by using raw training
-    targets rather than tree predictions, providing more accurate uncertainty
-    quantification especially in regions with heteroscedastic noise.
+    where L_b(x) is the leaf reached by x in tree b and |L_b(x)| is the count of
+    in-bag training samples in that leaf. Quantiles are read from the weighted
+    empirical CDF F_hat(y|x) = sum_i w_i(x) * 1(Y_i <= y) using linear
+    interpolation, matching numpy's default quantile convention.
+
+    Bootstrap membership is reconstructed via sklearn's internal
+    ``_generate_sample_indices`` with the exact RNG state each tree used during
+    ``forest.fit()``, guaranteeing identical in-bag sets.
+
+    At fit time a leaf-to-rank-index table is built once per tree, and weight
+    rows for all training samples are pre-computed and cached (keyed by their
+    leaf-ID signature). Tree leaf assignments use direct Cython ``tree_.apply``
+    calls, bypassing sklearn's per-call Python validation layer.
 
     Args:
         n_estimators: Number of trees in the forest.
         max_depth: Maximum depth of individual trees.
-        max_features: Fraction of features considered for best split.
-        min_samples_split: Minimum samples required to split internal nodes.
-        min_samples_leaf: Minimum samples required at leaf nodes.
-        bootstrap: Whether to use bootstrap sampling for tree training.
+        max_features: Fraction of features considered at each split.
+        min_samples_split: Minimum samples required to split an internal node.
+        min_samples_leaf: Minimum samples required at a leaf node.
+        bootstrap: Whether to use bootstrap sampling for each tree.
         random_state: Seed for reproducible tree construction.
     """
 
@@ -1010,22 +1027,21 @@ class QuantileLeaf(BaseSingleFitQuantileEstimator):
         self.min_samples_leaf = min_samples_leaf
         self.bootstrap = bootstrap
         self.random_state = random_state
-        self.X_train = None
-        self.y_train = None
+        self.y_train_sorted: Optional[np.ndarray] = None
         self.forest = None
+        self._leaf_table: Optional[List[Dict[int, np.ndarray]]] = None
 
     def _fit_implementation(self, X: np.ndarray, y: np.ndarray):
-        """Fit the random forest and store training data for leaf node lookup.
+        """Fit the forest and build the per-tree leaf-to-rank-index table.
 
         Args:
-            X: Training features with shape (n_samples, n_features).
-            y: Training targets with shape (n_samples,).
+            X: Training features, shape (n_samples, n_features).
+            y: Training targets, shape (n_samples,).
 
         Returns:
-            Self for method chaining.
+            Self.
         """
-        self.X_train = X.copy()
-        self.y_train = y.copy()
+        n_train = len(y)
 
         self.forest = RandomForestRegressor(
             n_estimators=self.n_estimators,
@@ -1037,84 +1053,169 @@ class QuantileLeaf(BaseSingleFitQuantileEstimator):
             random_state=self.random_state,
         )
         self.forest.fit(X, y)
+
+        sorter = np.argsort(y)
+        self.y_train_sorted = y[sorter]
+        rank_of = np.argsort(sorter)
+
+        n_bootstrap = _get_n_samples_bootstrap(n_train, self.forest.max_samples)
+        train_leaf_ids = self.forest.apply(X)
+        self._tree_apply_fns = [est.tree_.apply for est in self.forest.estimators_]
+
+        self._leaf_table = []
+        for b, estimator in enumerate(self.forest.estimators_):
+            bootstrap_indices = (
+                _generate_sample_indices(estimator.random_state, n_train, n_bootstrap)
+                if self.bootstrap
+                else np.arange(n_train)
+            )
+
+            inbag_ranks = rank_of[bootstrap_indices]
+            inbag_leaf_ids = train_leaf_ids[bootstrap_indices, b]
+
+            sorted_order = np.argsort(inbag_leaf_ids)
+            unique_leaves, starts = np.unique(inbag_leaf_ids[sorted_order], return_index=True)
+            ends = np.append(starts[1:], len(sorted_order))
+
+            self._leaf_table.append({
+                int(leaf): np.sort(inbag_ranks[sorted_order[s:e]])
+                for leaf, s, e in zip(unique_leaves, starts, ends)
+            })
+
+        self._weight_cache: Dict[bytes, np.ndarray] = {}
+        train_weights = self._weights_from_leaf_ids(train_leaf_ids)
+        for i in range(n_train):
+            self._weight_cache[train_leaf_ids[i].tobytes()] = train_weights[i]
+
         return self
 
-    def _get_candidate_local_distribution(self, X: np.ndarray) -> np.ndarray:
-        """Extract raw Y values from leaf nodes for quantile computation.
+    def _weights_from_leaf_ids(self, leaf_ids: np.ndarray) -> np.ndarray:
+        """Compute a Meinshausen (2006) weight matrix from leaf-ID assignments.
 
-        For each prediction point, finds all training targets that fall into
-        the same leaf nodes across all trees. This creates the empirical
-        distribution used for quantile estimation following Meinshausen (2006).
+        For each tree b, test points sharing a leaf with in-bag training samples
+        receive weight ``1/|L_b(x)|`` from those samples. Weights are accumulated
+        in rank space (aligned to ``y_train_sorted``) across all trees, then
+        normalised to sum to 1 per row.
 
         Args:
-            X: Features with shape (n_samples, n_features).
+            leaf_ids: Integer array (n_test, n_trees) of leaf node IDs.
 
         Returns:
-            Raw Y values from matching leaf nodes with shape (n_samples, variable).
-            Each row contains the training targets from leaf nodes that contain
-            the corresponding prediction point. Rows may have different lengths,
-            so the array is padded with NaN values and the actual distribution
-            is extracted during quantile computation.
+            Weight matrix (n_test, n_train_sorted), rows sum to 1.
         """
-        # Get leaf indices for training and test data for all trees
-        train_leaf_indices = self.forest.apply(self.X_train)  # (n_train, n_trees)
-        test_leaf_indices = self.forest.apply(X)  # (n_test, n_trees)
+        n_test = len(leaf_ids)
+        n_train = len(self.y_train_sorted)
+        n_trees = len(self.forest.estimators_)
 
-        # Collect Y values for each test point
-        candidate_distributions = []
+        weights = np.zeros((n_test, n_train), dtype=np.float64)
 
-        for i in range(len(X)):
-            y_values_for_point = []
+        for b in range(n_trees):
+            tree_table = self._leaf_table[b]
+            leaves_for_tree = leaf_ids[:, b]
 
-            # For each tree, find training points in the same leaf as test point i
-            for tree_idx in range(self.n_estimators):
-                test_leaf = test_leaf_indices[i, tree_idx]
-                # Find training points that ended up in the same leaf
-                same_leaf_mask = train_leaf_indices[:, tree_idx] == test_leaf
-                # Collect corresponding Y values
-                y_values_for_point.extend(self.y_train[same_leaf_mask])
+            sorted_order = np.argsort(leaves_for_tree)
+            unique_leaves, starts = np.unique(leaves_for_tree[sorted_order], return_index=True)
+            ends = np.append(starts[1:], n_test)
 
-            candidate_distributions.append(np.array(y_values_for_point))
+            for leaf, ts, te in zip(unique_leaves, starts, ends):
+                inbag_ranks = tree_table.get(int(leaf))
+                if inbag_ranks is None or len(inbag_ranks) == 0:
+                    continue
+                test_indices = sorted_order[ts:te]
+                weights[np.ix_(test_indices, inbag_ranks)] += 1.0 / len(inbag_ranks)
 
-        # Convert to consistent array format by padding with NaN
-        max_length = max(len(dist) for dist in candidate_distributions)
-        padded_distributions = np.full((len(X), max_length), np.nan)
+        weights /= n_trees
+        row_sums = weights.sum(axis=1, keepdims=True)
+        weights /= np.where(row_sums == 0, 1.0, row_sums)
+        return weights
 
-        for i, dist in enumerate(candidate_distributions):
-            padded_distributions[i, : len(dist)] = dist
+    def _proximity_weights(self, X: np.ndarray) -> np.ndarray:
+        """Return the weight matrix for X, served from cache where possible.
 
-        return padded_distributions
+        Each test point's weight row is uniquely determined by its leaf-ID
+        signature across all trees. The cache is keyed by this signature
+        (stable across feature-scaler changes). Misses are computed via the
+        vectorised ``_weights_from_leaf_ids`` and then stored.
+
+        Args:
+            X: Test features, shape (n_test, n_features).
+
+        Returns:
+            Weight matrix (n_test, n_train_sorted), rows sum to 1.
+        """
+        from sklearn.tree._tree import DTYPE as _SKLEARN_DTYPE
+
+        n_test = len(X)
+        n_train = len(self.y_train_sorted)
+        n_trees = len(self.forest.estimators_)
+
+        X_f32 = np.asarray(X, dtype=_SKLEARN_DTYPE, order="C")
+        leaf_ids = np.column_stack(
+            [self._tree_apply_fns[b](X_f32) for b in range(n_trees)]
+        )
+
+        weights = np.empty((n_test, n_train), dtype=np.float64)
+        cache = self._weight_cache
+        miss_indices = []
+
+        for i in range(n_test):
+            cached = cache.get(leaf_ids[i].tobytes())
+            if cached is not None:
+                weights[i] = cached
+            else:
+                miss_indices.append(i)
+
+        if miss_indices:
+            miss_arr = np.array(miss_indices)
+            miss_weights = self._weights_from_leaf_ids(leaf_ids[miss_arr])
+            for local_i, global_i in enumerate(miss_indices):
+                w = miss_weights[local_i]
+                weights[global_i] = w
+                cache[leaf_ids[global_i].tobytes()] = w
+
+        return weights
+
+    def _get_candidate_local_distribution(self, X: np.ndarray) -> np.ndarray:
+        raise NotImplementedError(
+            "QuantileLeaf predicts via a weighted empirical CDF; call predict() directly."
+        )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Generate quantile predictions from raw Y values in matching leaf nodes.
+        """Return quantile predictions for X via the weighted empirical CDF.
 
-        Overrides the base class method to handle variable-length distributions
-        from leaf nodes. Computes empirical quantiles while ignoring NaN padding.
+        Steps:
+        1. Compute proximity weights w_i(x) for each test point.
+        2. Form the weighted empirical CDF over sorted training targets.
+        3. Invert the CDF at each requested quantile with linear interpolation
+           (matching numpy's default 'linear' method).
 
         Args:
-            X: Features for prediction with shape (n_samples, n_features).
+            X: Features, shape (n_samples, n_features).
 
         Returns:
-            Quantile predictions with shape (n_samples, n_quantiles).
+            Quantile predictions, shape (n_samples, n_quantiles).
         """
-        candidate_distributions = self._get_candidate_local_distribution(X)
+        weights = self._proximity_weights(X)
+        cdf = np.cumsum(weights, axis=1)
 
-        # Compute quantiles for each test point, ignoring NaN values
-        quantile_preds = np.zeros((len(X), len(self.quantiles)))
+        quantiles_arr = np.asarray(self.quantiles)
+        n_test, n_train = weights.shape
 
-        for i in range(len(X)):
-            # Extract non-NaN values for this point
-            valid_values = candidate_distributions[i][
-                ~np.isnan(candidate_distributions[i])
-            ]
+        r_hi = np.apply_along_axis(
+            lambda row: np.searchsorted(row, quantiles_arr, side="left"),
+            axis=1,
+            arr=cdf,
+        )
+        r_hi = np.clip(r_hi, 0, n_train - 1)
+        r_lo = np.clip(r_hi - 1, 0, n_train - 1)
 
-            if len(valid_values) > 0:
-                # Compute empirical quantiles
-                quantile_preds[i] = np.quantile(valid_values, self.quantiles)
-            else:
-                # Fallback to forest mean prediction if no valid values
-                # This should rarely happen with proper forest configuration
-                mean_pred = self.forest.predict(X[i : i + 1])[0]
-                quantile_preds[i] = mean_pred
+        y_hi = self.y_train_sorted[r_hi]
+        y_lo = self.y_train_sorted[r_lo]
+        cdf_hi = cdf[np.arange(n_test)[:, None], r_hi]
+        cdf_lo = cdf[np.arange(n_test)[:, None], r_lo]
 
-        return quantile_preds
+        denom = cdf_hi - cdf_lo
+        safe_denom = np.where(denom > 0, denom, 1.0)
+        fraction = np.where(denom > 0, (quantiles_arr[None, :] - cdf_lo) / safe_denom, 0.0)
+
+        return y_lo + fraction * (y_hi - y_lo)
