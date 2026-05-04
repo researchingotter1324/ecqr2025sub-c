@@ -26,6 +26,11 @@ from ccqr_optimization.selection.sampling.expected_improvement_samplers import (
     ExpectedImprovementSampler,
 )
 from ccqr_optimization.selection.sampling.local_search import LocalSearchOptimizer
+from ccqr_optimization.selection.estimator_configuration import (
+    QRF_NAME,
+    QLEAF_NAME,
+    QGBM_NAME,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,34 @@ def stop_search(
             return True
 
     return False
+
+
+def _validate_searcher_architecture_compatibility(searcher: BaseConformalSearcher) -> None:
+    """Validate that searcher architecture and sampler combination is compatible.
+    
+    Raises RuntimeError if a tree-based quantile estimator is paired with 
+    ExpectedImprovementSampler, as tree models cannot extrapolate beyond 
+    training y-range and thus cannot provide non-zero expected improvement.
+    
+    Args:
+        searcher: The BaseConformalSearcher instance to validate.
+        
+    Raises:
+        RuntimeError: If incompatible architecture-sampler combination detected.
+    """
+    if isinstance(searcher, QuantileConformalSearcher):
+        tree_based_architectures = {QRF_NAME, QLEAF_NAME, QGBM_NAME}
+        if (
+            searcher.quantile_estimator_architecture in tree_based_architectures
+            and isinstance(searcher.sampler, ExpectedImprovementSampler)
+        ):
+            raise RuntimeError(
+                f"Incompatible architecture-sampler combination: "
+                f"'{searcher.quantile_estimator_architecture}' quantile estimator cannot be paired with "
+                f"ExpectedImprovementSampler. Tree-based quantile models are bounded by training data "
+                f"range and cannot provide non-zero expected improvement once the current best equals "
+                f"y_min_train. Use LowerBoundSampler, PessimisticLowerBoundSampler, or ThompsonSampler instead."
+            )
 
 
 class ConformalTuner:
@@ -425,7 +458,7 @@ class ConformalTuner:
 
         Passes the full searchable pool to LocalSearchOptimizer, which scores it internally
         to establish a baseline, selects diverse epicenters from both the random pool and the
-        evaluated history, and runs a per-epicenter stochastic perturbation search.
+        evaluated history, and runs a per-epicenter DFO walk.
 
         Works with any sampler that exposes a ``use_local_search`` flag
         (ExpectedImprovementSampler, PessimisticLowerBoundSampler, LowerBoundSampler).
@@ -573,6 +606,8 @@ class ConformalTuner:
             max_runtime: Maximum total runtime budget in seconds
             optimizer_framework: Parameter tuning strategy
         """
+        _validate_searcher_architecture_compatibility(searcher)
+        
         (
             progress_manager,
             conformal_max_searches,
@@ -731,6 +766,18 @@ class ConformalTuner:
             random_state: Random seed for reproducible results. Default: None.
             verbose: Whether to enable progress display. Default: True.
 
+        Local search is enabled by setting ``use_local_search=True`` on the sampler
+        (e.g. ``LowerBoundSampler``, ``PessimisticLowerBoundSampler``,
+        ``ExpectedImprovementSampler``)::
+
+            from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
+            from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
+
+            searcher = QuantileConformalSearcher(
+                sampler=LowerBoundSampler(use_local_search=True)
+            )
+            tuner.tune(searcher=searcher, ...)
+
         Example:
             Basic usage::
 
@@ -752,9 +799,8 @@ class ConformalTuner:
                 tuner = ConformalTuner(
                     objective_function=objective,
                     search_space=search_space,
-                    minimize=False
+                    minimize=False,
                 )
-
                 tuner.tune(n_random_searches=25, max_searches=100)
 
                 best_config = tuner.get_best_params()
