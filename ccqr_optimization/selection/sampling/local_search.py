@@ -594,7 +594,9 @@ class LocalSearchOptimizer:
         """
         Minimize model_fn over [0, 1]^d via L-BFGS-B with 3 random restarts.
 
-        Raises ``RuntimeError`` if scipy minimization fails to produce any result.
+        When all restarts return nan (degenerate flat model), proposes the domain
+        centre [0.5, …, 0.5]. The ρ-ratio will then shrink the trust region on the
+        resulting stall and the walk continues — standard DFO recovery behaviour.
         """
         d = len(self.cont_int_names)
         if d == 0:
@@ -606,11 +608,11 @@ class LocalSearchOptimizer:
                 model_fn, self.rng.random(d), jac=grad_fn, method="L-BFGS-B",
                 bounds=[(0.0, 1.0)] * d, options={"maxiter": self.lbfgs_maxiter, "ftol": 1e-9},
             )
-            if res.fun < best_val:
+            if not np.isnan(res.fun) and res.fun < best_val:
                 best_val, best_u = res.fun, res.x
 
         if best_u is None:
-            raise RuntimeError("L-BFGS-B minimization produced no result.")
+            return np.full(d, 0.5)
         return np.clip(best_u, 0.0, 1.0)
 
     def clamp(self, config: Config) -> Config:
