@@ -342,7 +342,6 @@ class StaticConfigurationManager(BaseConfigurationManager):
             parameter_grid=self.search_space,
             n_configurations=self.n_candidate_configurations,
             random_state=None,
-            sampling_method="uniform",
         )
 
         # Setup encoder
@@ -458,7 +457,6 @@ class DynamicConfigurationManager(BaseConfigurationManager):
             n_configurations=self.n_candidate_configurations
             + len(self.searched_configs),
             random_state=None,
-            sampling_method="uniform",
         )
 
         banned_hashes = set(create_config_hash(c) for c in self.banned_configurations)
