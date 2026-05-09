@@ -148,7 +148,6 @@ class TestLowerBoundSampler:
 
         assert sampler.t == 1
         assert sampler.beta == 1
-        assert sampler.mu_max == float("-inf")
 
     def test_update_exploration_step_time_increment(self):
         """Test time step increment in exploration update."""
@@ -220,29 +219,29 @@ class TestLowerBoundSampler:
         with pytest.raises(ValueError, match="beta_decay must be"):
             sampler.update_exploration_step()
 
-    def test_calculate_ucb_predictions_basic(self, test_predictions_and_widths):
+    def test_calculate_lcb_predictions_basic(self, test_predictions_and_widths):
         """Test basic LCB calculation functionality."""
         point_estimates, interval_widths = test_predictions_and_widths
         sampler = LowerBoundSampler()
 
-        lcb_values = sampler.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_values = sampler.calculate_lcb_predictions(point_estimates, interval_widths)
 
         assert lcb_values.shape == point_estimates.shape
         assert isinstance(lcb_values, np.ndarray)
 
-    def test_calculate_ucb_predictions_formula(self, test_predictions_and_widths):
+    def test_calculate_lcb_predictions_formula(self, test_predictions_and_widths):
         """Test LCB formula implementation."""
         point_estimates, interval_widths = test_predictions_and_widths
         beta = 2.0
         sampler = LowerBoundSampler()
         sampler.beta = beta
 
-        lcb_values = sampler.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_values = sampler.calculate_lcb_predictions(point_estimates, interval_widths)
         expected_values = point_estimates - beta * interval_widths
 
         np.testing.assert_array_almost_equal(lcb_values, expected_values)
 
-    def test_calculate_ucb_predictions_beta_effect(self, test_predictions_and_widths):
+    def test_calculate_lcb_predictions_beta_effect(self, test_predictions_and_widths):
         """Test effect of different beta values on LCB calculations."""
         point_estimates, interval_widths = test_predictions_and_widths
 
@@ -252,29 +251,29 @@ class TestLowerBoundSampler:
         beta_high = LowerBoundSampler()
         beta_high.beta = 3.0
 
-        lcb_low = beta_low.calculate_ucb_predictions(point_estimates, interval_widths)
-        lcb_high = beta_high.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_low = beta_low.calculate_lcb_predictions(point_estimates, interval_widths)
+        lcb_high = beta_high.calculate_lcb_predictions(point_estimates, interval_widths)
 
         # Higher beta should lead to lower (more conservative) LCB values
         assert np.all(lcb_high < lcb_low)
 
-    def test_calculate_ucb_predictions_edge_cases(self):
+    def test_calculate_lcb_predictions_edge_cases(self):
         """Test LCB calculation with edge case inputs."""
         sampler = LowerBoundSampler()
 
         # Zero interval widths
         point_estimates = np.array([1, 2, 3])
         interval_widths = np.zeros(3)
-        lcb_values = sampler.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_values = sampler.calculate_lcb_predictions(point_estimates, interval_widths)
         np.testing.assert_array_equal(lcb_values, point_estimates)
 
         # Single point
         single_point = np.array([5.0])
         single_width = np.array([1.0])
-        lcb_single = sampler.calculate_ucb_predictions(single_point, single_width)
+        lcb_single = sampler.calculate_lcb_predictions(single_point, single_width)
         assert lcb_single.shape == (1,)
 
-    def test_calculate_ucb_predictions_negative_inputs(self):
+    def test_calculate_lcb_predictions_negative_inputs(self):
         """Test LCB calculation with negative inputs."""
         sampler = LowerBoundSampler()
         sampler.beta = 1.5
@@ -282,7 +281,7 @@ class TestLowerBoundSampler:
         point_estimates = np.array([-2, -1, 0, 1, 2])
         interval_widths = np.array([0.5, 1.0, 1.5, 1.0, 0.5])
 
-        lcb_values = sampler.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_values = sampler.calculate_lcb_predictions(point_estimates, interval_widths)
         expected = point_estimates - 1.5 * interval_widths
 
         np.testing.assert_array_almost_equal(lcb_values, expected)
@@ -330,7 +329,7 @@ class TestLowerBoundSampler:
         sampler = LowerBoundSampler()
         sampler.beta = 1.0
 
-        lcb_values = sampler.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_values = sampler.calculate_lcb_predictions(point_estimates, interval_widths)
 
         # LCB should be lower than point estimates when interval_widths > 0
         mask = interval_widths > 0
@@ -346,10 +345,10 @@ class TestLowerBoundSampler:
         sampler_aggressive = LowerBoundSampler(c=10.0)
         sampler_aggressive.update_exploration_step()
 
-        lcb_conservative = sampler_conservative.calculate_ucb_predictions(
+        lcb_conservative = sampler_conservative.calculate_lcb_predictions(
             point_estimates, interval_widths
         )
-        lcb_aggressive = sampler_aggressive.calculate_ucb_predictions(
+        lcb_aggressive = sampler_aggressive.calculate_lcb_predictions(
             point_estimates, interval_widths
         )
 
@@ -367,14 +366,14 @@ class TestLowerBoundSampler:
         assert sampler.beta <= beta_max
 
     @pytest.mark.parametrize("array_size", [1, 10, 100, 1000])
-    def test_calculate_ucb_predictions_scalability(self, array_size):
+    def test_calculate_lcb_predictions_scalability(self, array_size):
         """Test LCB calculation scalability with different array sizes."""
         sampler = LowerBoundSampler()
 
         point_estimates = np.random.uniform(-5, 5, array_size)
         interval_widths = np.random.uniform(0.1, 2.0, array_size)
 
-        lcb_values = sampler.calculate_ucb_predictions(point_estimates, interval_widths)
+        lcb_values = sampler.calculate_lcb_predictions(point_estimates, interval_widths)
 
         assert lcb_values.shape == (array_size,)
         assert len(lcb_values) == array_size

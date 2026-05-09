@@ -20,12 +20,10 @@ from ccqr_optimization.selection.acquisition import (
     QuantileConformalSearcher,
     LowerBoundSampler,
     PessimisticLowerBoundSampler,
-    BaseConformalSearcher,
 )
 from ccqr_optimization.selection.sampling.expected_improvement_samplers import (
     ExpectedImprovementSampler,
 )
-from ccqr_optimization.selection.sampling.local_search import LocalSearchOptimizer
 from ccqr_optimization.selection.estimator_configuration import (
     QRF_NAME,
     QLEAF_NAME,
@@ -72,7 +70,7 @@ def stop_search(
     return False
 
 
-def _validate_searcher_architecture_compatibility(searcher: BaseConformalSearcher) -> None:
+def validate_searcher_architecture_compatibility(searcher: QuantileConformalSearcher) -> None:
     """Validate that searcher architecture and sampler combination is compatible.
     
     Raises RuntimeError if a tree-based quantile estimator is paired with 
@@ -80,24 +78,23 @@ def _validate_searcher_architecture_compatibility(searcher: BaseConformalSearche
     training y-range and thus cannot provide non-zero expected improvement.
     
     Args:
-        searcher: The BaseConformalSearcher instance to validate.
+        searcher: The QuantileConformalSearcher instance to validate.
         
     Raises:
         RuntimeError: If incompatible architecture-sampler combination detected.
     """
-    if isinstance(searcher, QuantileConformalSearcher):
-        tree_based_architectures = {QRF_NAME, QLEAF_NAME, QGBM_NAME}
-        if (
-            searcher.quantile_estimator_architecture in tree_based_architectures
-            and isinstance(searcher.sampler, ExpectedImprovementSampler)
-        ):
-            raise RuntimeError(
-                f"Incompatible architecture-sampler combination: "
-                f"'{searcher.quantile_estimator_architecture}' quantile estimator cannot be paired with "
-                f"ExpectedImprovementSampler. Tree-based quantile models are bounded by training data "
-                f"range and cannot provide non-zero expected improvement once the current best equals "
-                f"y_min_train. Use LowerBoundSampler, PessimisticLowerBoundSampler, or ThompsonSampler instead."
-            )
+    tree_based_architectures = {QRF_NAME, QLEAF_NAME, QGBM_NAME}
+    if (
+        searcher.quantile_estimator_architecture in tree_based_architectures
+        and isinstance(searcher.sampler, ExpectedImprovementSampler)
+    ):
+        raise RuntimeError(
+            f"Incompatible architecture-sampler combination: "
+            f"'{searcher.quantile_estimator_architecture}' quantile estimator cannot be paired with "
+            f"ExpectedImprovementSampler. Tree-based quantile models are bounded by training data "
+            f"range and cannot provide non-zero expected improvement once the current best equals "
+            f"y_min_train. Use LowerBoundSampler, PessimisticLowerBoundSampler, or ThompsonSampler instead."
+        )
 
 
 class ConformalTuner:
@@ -241,7 +238,7 @@ class ConformalTuner:
         if self.warm_starts:
             self.process_warm_starts()
 
-    def _evaluate_configuration(self, configuration: Dict) -> Tuple[float, float]:
+    def evaluate_configuration(self, configuration: Dict) -> Tuple[float, float]:
         """Evaluate a configuration and measure execution time.
 
         Executes the objective function with the given configuration while tracking
@@ -297,7 +294,7 @@ class ConformalTuner:
         )
 
         for config in progress_iter:
-            validation_performance, training_time = self._evaluate_configuration(config)
+            validation_performance, training_time = self.evaluate_configuration(config)
 
             if np.isnan(validation_performance):
                 logger.debug(
@@ -416,7 +413,7 @@ class ConformalTuner:
 
     def retrain_searcher(
         self,
-        searcher: BaseConformalSearcher,
+        searcher: QuantileConformalSearcher,
         X: np.array,
         y: np.array,
         tuning_count: int,
@@ -447,94 +444,9 @@ class ConformalTuner:
         training_runtime = runtime_tracker.return_runtime()
         return training_runtime
 
-    def _select_next_via_local_search(
-        self,
-        searcher: BaseConformalSearcher,
-        searchable_configs: List[Dict],
-        local_search_iterations: int,
-        previous_configs_to_use: int,
-    ) -> Dict:
-        """Refine acquisition on the random candidate pool with local search; return best config.
-
-        Passes the full searchable pool to LocalSearchOptimizer, which scores it internally
-        to establish a baseline, selects diverse epicenters from both the random pool and the
-        evaluated history, and runs a per-epicenter DFO walk.
-
-        Works with any sampler that exposes a ``use_local_search`` flag
-        (ExpectedImprovementSampler, PessimisticLowerBoundSampler, LowerBoundSampler).
-
-        All acquisition scoring uses the codebase-native lower-is-better convention.
-
-        Args:
-            searcher: Fitted conformal searcher whose sampler has ``use_local_search=True``.
-            searchable_configs: Full random candidate pool for this iteration.
-            local_search_iterations: Passed as n_acq_epicenters to LocalSearchOptimizer.
-            previous_configs_to_use: Passed as n_historical_epicenters to LocalSearchOptimizer.
-
-        Returns:
-            Configuration selected after local search.
-        """
-        local_optimizer = LocalSearchOptimizer(
-            search_space=self.search_space,
-            config_manager=self.config_manager,
-            metric_sign=self.metric_sign,
-            n_historical_epicenters=previous_configs_to_use,
-            n_acq_epicenters=local_search_iterations,
-        )
-        return local_optimizer.select_next(
-            searcher=searcher,
-            candidates=searchable_configs,
-        )
-
-    def select_next_configuration(
-        self,
-        searcher: BaseConformalSearcher,
-        searchable_configs: List,
-        transformed_configs: np.array,
-        local_search_iterations: int = 10,
-        previous_configs_to_use: int = 6,
-    ) -> Dict:
-        """Select the most promising configuration using conformal predictions.
-
-        Uses the conformal searcher to score all searchable configurations in the current
-        pool. When the sampler has ``use_local_search=True`` (supported by
-        ExpectedImprovementSampler, PessimisticLowerBoundSampler, and LowerBoundSampler),
-        runs local search on top candidates to maximize the acquisition surface beyond the
-        initial random pool. In the local search path, ``transformed_configs`` is not used
-        because the optimizer performs its own internal scoring.
-        Otherwise returns the configuration with the best (minimum) acquisition score in
-        that pool directly.
-
-        Args:
-            searcher: Trained conformal searcher for predictions
-            searchable_configs: List of available configuration dictionaries
-            transformed_configs: Scaled feature matrix for configurations; used only in the
-                non-local-search path.
-            local_search_iterations: Top acquisition points from the candidate pool to seed local search
-            previous_configs_to_use: Top acquisition points from evaluated history to seed local search
-
-        Returns:
-            Selected configuration dictionary
-        """
-        if hasattr(searcher.sampler, "use_local_search") and searcher.sampler.use_local_search:
-            # LocalSearchOptimizer scores the pool itself (Phase 0) so we skip the
-            # full-pool predict call here to avoid a redundant and expensive batch evaluation.
-            selected = self._select_next_via_local_search(
-                searcher=searcher,
-                searchable_configs=searchable_configs,
-                local_search_iterations=local_search_iterations,
-                previous_configs_to_use=previous_configs_to_use,
-            )
-        else:
-            bounds = searcher.predict(X=transformed_configs)
-            next_idx = int(np.argmin(bounds))
-            selected = searchable_configs[next_idx]
-
-        return selected
-
     def get_interval_if_applicable(
         self,
-        searcher: BaseConformalSearcher,
+        searcher: QuantileConformalSearcher,
         transformed_config: np.array,
     ) -> Tuple[Optional[float], Optional[float]]:
         """Get prediction interval bounds if supported by searcher.
@@ -584,7 +496,7 @@ class ConformalTuner:
 
     def conformal_search(
         self,
-        searcher: BaseConformalSearcher,
+        searcher: QuantileConformalSearcher,
         conformal_retraining_frequency: int,
         verbose: bool,
         max_searches: Optional[int],
@@ -606,7 +518,7 @@ class ConformalTuner:
             max_runtime: Maximum total runtime budget in seconds
             optimizer_framework: Parameter tuning strategy
         """
-        _validate_searcher_architecture_compatibility(searcher)
+        validate_searcher_architecture_compatibility(searcher)
         
         (
             progress_manager,
@@ -635,7 +547,6 @@ class ConformalTuner:
             y = np.array(self.config_manager.searched_performances) * self.metric_sign
 
             searchable_configs = self.config_manager.get_searchable_configurations()
-            X_searchable = self.config_manager.tabularize_configs(searchable_configs)
 
             if search_iter == 0 or search_iter % conformal_retraining_frequency == 0:
                 training_runtime = self.retrain_searcher(searcher, X, y, tuning_count)
@@ -656,13 +567,15 @@ class ConformalTuner:
                         "searcher_retuning_frequency must be a multiple of conformal_retraining_frequency."
                     )
 
-            # Select next configuration
-            next_config = self.select_next_configuration(
-                searcher, searchable_configs, X_searchable
+            next_config = searcher.select_next(
+                candidates=searchable_configs,
+                config_manager=self.config_manager,
+                search_space=self.search_space,
+                metric_sign=self.metric_sign,
             )
 
             # Evaluate configuration
-            performance, _ = self._evaluate_configuration(next_config)
+            performance, _ = self.evaluate_configuration(next_config)
             if np.isnan(performance):
                 self.config_manager.add_to_banned_configurations(next_config)
                 continue
@@ -739,44 +652,36 @@ class ConformalTuner:
         for baseline data, then conformal prediction-guided optimization using uncertainty
         quantification to select promising configurations.
 
-        Args:
-            max_searches: Maximum total configurations to search (random + conformal searches).
-                Default: 100.
-            max_runtime: Maximum search time in seconds. Search will terminate after this time,
-                regardless of iterations. Default: None (no time limit).
-            searcher: Conformal acquisition function. Defaults to QuantileConformalSearcher
-                with LowerBoundSampler. You should not need to change this, as the default
-                searcher performs best across most tasks in offline benchmarks. Should you want
-                to use a different searcher, you can pass any subclass of BaseConformalSearcher.
-                See ccqr_optimization.selection.acquisition for all available searchers and
-                ccqr_optimization.selection.acquisition.samplers to set the searcher's sampler.
-                Default: None.
-            n_random_searches: Number of random configurations to evaluate before conformal search.
-                Provides initial training data for the surrogate model. Default: 15.
-            conformal_retraining_frequency: How often the conformal surrogate model retrains
-                (the model will retrain every conformal_retraining_frequency-th search iteration).
-                Recommended values are 1 if your target model takes >1 min to train, 2-5 if your
-                target model is very small to reduce computational overhead. Default: 1.
-            optimizer_framework: Controls how and when the surrogate model tunes its own parameters
-                (this is different from tuning your target model). Options are 'decaying' for
-                adaptive tuning with increasing intervals over time, 'fixed' for
-                deterministic tuning at fixed intervals, or None for no tuning. Surrogate tuning
-                adds computational cost and is recommended only if your target model takes more
-                than 1-5 minutes to train. Default: None.
-            random_state: Random seed for reproducible results. Default: None.
-            verbose: Whether to enable progress display. Default: True.
-
-        Local search is enabled by setting ``use_local_search=True`` on the sampler
-        (e.g. ``LowerBoundSampler``, ``PessimisticLowerBoundSampler``,
-        ``ExpectedImprovementSampler``)::
+        Local search is configured at sampler construction time via the
+        ``local_search_algorithm`` parameter on the sampler (e.g. ``LowerBoundSampler``,
+        ``PessimisticLowerBoundSampler``, ``ExpectedImprovementSampler``). Pass a
+        ``DFOLocalSearch`` or ``SmacLocalSearch`` instance::
 
             from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
             from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
+            from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 
             searcher = QuantileConformalSearcher(
-                sampler=LowerBoundSampler(use_local_search=True)
+                quantile_estimator_architecture="qrf",
+                sampler=LowerBoundSampler(local_search_algorithm=SmacLocalSearch()),
             )
-            tuner.tune(searcher=searcher, ...)
+            tuner.tune(searcher=searcher)
+
+        Args:
+            max_searches: Maximum total configurations to evaluate (random + conformal).
+                Default: 100.
+            max_runtime: Maximum search time in seconds. Default: None (no time limit).
+            searcher: Conformal acquisition function. Defaults to QuantileConformalSearcher
+                with LowerBoundSampler and no local search. Pass a custom instance to change
+                the sampler, architecture, or enable local search.
+            n_random_searches: Number of random configurations to evaluate before conformal
+                search begins. Default: 15.
+            conformal_retraining_frequency: Retrains the surrogate every N iterations.
+                Default: 1.
+            optimizer_framework: Controls surrogate self-tuning. Options: 'decaying',
+                'fixed', or None (no tuning). Default: None.
+            random_state: Random seed for reproducibility. Default: None.
+            verbose: Whether to display a progress bar. Default: True.
 
         Example:
             Basic usage::

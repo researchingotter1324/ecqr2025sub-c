@@ -1,66 +1,41 @@
-"""
-Expected Improvement acquisition strategy for conformal prediction optimization.
+"""Expected Improvement acquisition strategy for conformal prediction optimization.
 
-This module implements Expected Improvement (EI) acquisition functions using
-conformal prediction intervals to quantify uncertainty. The approach extends
-classical Bayesian optimization's Expected Improvement to conformal prediction
-settings, enabling efficient acquisition function optimization without requiring
-explicit posterior distributions.
+Estimates Expected Improvement (EI) by Monte Carlo sampling from quantile-based
+conformal prediction intervals. Extends classical Bayesian EI to conformal
+settings without requiring an explicit posterior.
 
-Expected Improvement methodology:
-The acquisition function computes the expected value of improvement over the
-current best observation by sampling from prediction intervals. This provides
-a natural exploration-exploitation balance, with high values indicating either
-high predicted improvement (exploitation) or high uncertainty (exploration).
-
-Key features:
-- Monte Carlo estimation of expected improvement using interval sampling
-- Adaptive current best value tracking for dynamic optimization
-- Quantile-based interval construction with symmetric pairing
-- Adaptive interval width adjustment using coverage feedback
-- Efficient vectorized computation for large candidate sets
-
-The module integrates with conformal prediction frameworks by accepting
-ConformalBounds objects and providing standardized interfaces for uncertainty
-quantification and acquisition function optimization.
+The sampler exposes:
+    score(searcher, X): the acquisition value used by local search
+        (negated EI, lower-is-better).
+    select_next(searcher, candidates, ...): top-level selection that scores the
+        candidate pool, optionally refines via a local search algorithm, and
+        returns the chosen configuration.
 """
 
-from typing import Optional, List, Literal
+from typing import Dict, List, Literal, Optional, Union
+
 import numpy as np
-from ccqr_optimization.wrapping import ConformalBounds
+
+from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
+from ccqr_optimization.utils.tracking import BaseConfigurationManager
+from ccqr_optimization.selection.sampling.local_search.dfo_search import DFOLocalSearch
+from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.sampling.utils import (
-    initialize_quantile_alphas,
+    flatten_conformal_bounds,
     initialize_multi_adapters,
+    initialize_quantile_alphas,
     update_multi_interval_widths,
     validate_even_quantiles,
-    flatten_conformal_bounds,
 )
+from ccqr_optimization.wrapping import ConformalBounds, ParameterRange
 
 
 class ExpectedImprovementSampler:
-    """
-    Expected Improvement acquisition strategy using conformal prediction intervals.
+    """Expected Improvement acquisition strategy using conformal prediction intervals.
 
-    This class implements Expected Improvement for optimization under uncertainty
-    using conformal prediction intervals as uncertainty quantification. The
-    sampler estimates expected improvement through Monte Carlo sampling from
-    prediction intervals, providing a principled approach to balancing
-    exploration and exploitation without requiring explicit posterior models.
-
-    Methodological approach:
-    - Constructs nested prediction intervals using symmetric quantile pairing
-    - Estimates expected improvement via Monte Carlo sampling from intervals
-    - Tracks current best value for improvement computation
-    - Adapts interval widths using empirical coverage feedback
-
-    The acquisition function naturally balances exploration (high uncertainty
-    regions) with exploitation (promising low-value regions) by computing
-    expected improvements over the current best observation.
-
-    Performance characteristics:
-    - O(n_samples * n_intervals * n_observations) for EI computation
-    - Efficient vectorized operations for batch evaluation
-    - Adaptive complexity through configurable sample count
+    EI is estimated via Monte Carlo sampling from quantile-based conformal
+    prediction intervals, providing a principled exploration-exploitation
+    balance without explicit posterior models.
     """
 
     def __init__(
@@ -69,78 +44,54 @@ class ExpectedImprovementSampler:
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
         current_best_value: float = float("inf"),
         num_ei_samples: int = 20,
-        use_local_search: bool = True,
-    ):
+        local_search_algorithm: Optional[Union[DFOLocalSearch, SmacLocalSearch]] = None,
+    ) -> None:
         """
-        Initialize Expected Improvement sampler with interval construction.
-
         Args:
             n_quantiles: Number of quantiles for interval construction. Must be even
-                for symmetric pairing. Higher values provide finer uncertainty
-                granularity but increase computational cost. Typical values: 4-8.
-            adapter: Interval width adaptation strategy. "DtACI" provides aggressive
-                multi-scale adaptation, "ACI" offers conservative adaptation,
-                None disables adaptation.
-            current_best_value: Initial best observed value for improvement
-                calculation. Should be set to the minimum observed objective
-                value. Updated automatically through update_best_value().
-            num_ei_samples: Number of Monte Carlo samples for EI estimation.
-                Higher values provide more accurate estimates but increase
-                computational cost. Typical values: 10-50.
-            use_local_search: When True (default), the conformal tuning loop may run
-                a local search refiner on the acquisition surface after scoring the
-                candidate pool. When False, selection uses the best-scoring point
-                in that pool only (no extra surrogate predictions for local search).
+                for symmetric pairing. Typical values: 4-8.
+            adapter: Interval width adaptation strategy. ``"DtACI"`` is aggressive
+                multi-scale adaptation; ``"ACI"`` is conservative; ``None`` disables.
+            current_best_value: Initial best observed value for improvement computation.
+                Updated automatically via ``update_best_value``.
+            num_ei_samples: Number of Monte Carlo samples for EI estimation. Typical: 10-50.
+            local_search_algorithm: Optional local search algorithm applied after
+                initial candidate scoring. ``None`` returns the best candidate
+                from the random pool directly.
         """
         validate_even_quantiles(n_quantiles, "Expected Improvement")
 
         self.n_quantiles = n_quantiles
         self.current_best_value = current_best_value
         self.num_ei_samples = num_ei_samples
-        self.use_local_search = use_local_search
+        self.local_search_algorithm: Optional[BaseLocalSearchAlgorithm] = local_search_algorithm
 
-        # Initialize symmetric quantile-based alpha values
         self.alphas = initialize_quantile_alphas(n_quantiles)
-        # Configure adapters for interval width adjustment
         self.adapters = initialize_multi_adapters(self.alphas, adapter)
 
-    def update_best_value(self, value: float):
-        """
-        Update current best observed value for improvement computation.
+    def update_best_value(self, value: float) -> None:
+        """Update the current best observed value.
 
-        This method should be called after each new observation to maintain
-        accurate improvement calculations. The best value serves as the baseline
-        for computing expected improvements in subsequent acquisition decisions.
+        ``value`` must be in signed minimization space (i.e.
+        ``metric_sign * raw_performance``), matching the space in which the
+        model is trained and the conformal intervals are produced. Taking the
+        min is correct because lower signed values are better regardless of
+        the original optimization direction.
 
         Args:
-            value: Newly observed objective value to compare with current best.
-                For minimization problems, this updates the minimum observed value.
+            value: Newly observed signed performance (``metric_sign * raw``).
         """
         self.current_best_value = min(self.current_best_value, value)
 
     def fetch_alphas(self) -> List[float]:
-        """
-        Retrieve current alpha values for interval construction.
-
-        Returns:
-            List of alpha values (miscoverage rates) for each confidence level,
-            ordered from lowest to highest confidence (decreasing alpha values).
-        """
+        """Return current alpha values, ordered from lowest to highest confidence."""
         return self.alphas
 
-    def update_interval_width(self, betas: List[float]):
-        """
-        Update interval widths using observed coverage rates.
-
-        This method applies adaptive interval width adjustment based on empirical
-        coverage feedback. Each interval's alpha parameter is updated independently
-        to maintain target coverage while optimizing interval efficiency for
-        accurate expected improvement estimation.
+    def update_interval_width(self, betas: List[float]) -> None:
+        """Update interval widths using observed coverage rates.
 
         Args:
-            betas: Observed coverage rates for each interval, in the same order
-                as alpha values. Values should be in [0, 1] representing the
-                fraction of true values falling within each interval.
+            betas: Observed coverage rates for each interval, one per alpha level.
         """
         self.alphas = update_multi_interval_widths(self.adapters, self.alphas, betas)
 
@@ -148,55 +99,97 @@ class ExpectedImprovementSampler:
         self,
         predictions_per_interval: List[ConformalBounds],
     ) -> np.ndarray:
-        """
-        Calculate Expected Improvement for each candidate point using Monte Carlo sampling.
-
-        This method estimates the expected improvement acquisition function by
-        Monte Carlo sampling from prediction intervals. For each candidate point,
-        multiple samples are drawn from its prediction intervals, improvements
-        over the current best are computed, and the expectation is estimated
-        as the sample mean.
+        """Calculate Expected Improvement for each candidate via Monte Carlo sampling.
 
         Methodology:
-        1. Flatten prediction intervals into efficient matrix representation
-        2. Generate random samples from intervals for each observation
-        3. Compute improvements: max(0, current_best - sampled_value)
-        4. Estimate expected improvement as sample mean
-        5. Return negated values for minimization compatibility
+            1. Flatten prediction intervals into a matrix representation.
+            2. Randomly sample from intervals for each observation.
+            3. Compute improvements: ``max(0, current_best - sampled_value)``.
+               This is the standard minimization-EI formula: improvement is
+               positive when a realization is lower than the best seen so far.
+               Because the model is trained on ``metric_sign``-adjusted targets
+               and ``current_best_value`` is also maintained in that same
+               signed space, no additional ``metric_sign`` multiplication is
+               needed here.
+            4. Estimate EI as the sample mean across draws.
+            5. Return negated EI so that lower acquisition values indicate
+               higher expected improvement (lower-is-better convention).
 
         Args:
-            predictions_per_interval: List of ConformalBounds objects containing
-                lower and upper bounds for each confidence level. All bounds
-                must have the same number of observations.
+            predictions_per_interval: ConformalBounds for each confidence level,
+                in signed minimization space. All bounds must have the same
+                number of observations.
 
         Returns:
-            Array of expected improvement values with shape (n_observations,).
-            Values are negated for minimization (higher EI = more negative value).
-            Points with higher expected improvement are more attractive for
-            next evaluation.
+            Array of shape (n_observations,) with negated EI (lower-is-better).
         """
-        # Flatten intervals into efficient matrix representation
         all_bounds = flatten_conformal_bounds(predictions_per_interval)
-
         n_observations = len(predictions_per_interval[0].lower_bounds)
 
-        # Generate random sample indices for Monte Carlo estimation
-        idxs = np.random.randint(
-            0, all_bounds.shape[1], size=(n_observations, self.num_ei_samples)
-        )
+        idxs = np.random.randint(0, all_bounds.shape[1], size=(n_observations, self.num_ei_samples))
 
-        # Extract interval samples for each observation
-        realizations_per_observation = np.zeros((n_observations, self.num_ei_samples))
+        realizations = np.zeros((n_observations, self.num_ei_samples))
         for i in range(n_observations):
-            realizations_per_observation[i] = all_bounds[i, idxs[i]]
+            realizations[i] = all_bounds[i, idxs[i]]
 
-        # Compute improvements over current best value
-        improvements_per_observation = np.maximum(
-            0, self.current_best_value - realizations_per_observation
-        )
+        improvements = np.maximum(0, self.current_best_value - realizations)
+        expected_improvements = np.mean(improvements, axis=1)
 
-        # Estimate expected improvement as sample mean
-        expected_improvements = np.mean(improvements_per_observation, axis=1)
-
-        # Return negated for minimization compatibility
         return -expected_improvements
+
+    def score(self, searcher, X: np.ndarray) -> np.ndarray:
+        """EI acquisition values for ``X`` (lower-is-better, i.e. negated EI).
+
+        Used by both top-level selection and any local search algorithm that
+        invokes ``searcher.predict``, which delegates to this method.
+
+        Args:
+            searcher: Fitted conformal searcher.
+            X: Tabularized candidate features, shape (n_candidates, n_features).
+
+        Returns:
+            Negated EI, shape (n_candidates,).
+        """
+        intervals = searcher.predict_intervals(X)
+        return self.calculate_expected_improvement(intervals)
+
+    def select_next(
+        self,
+        searcher,
+        candidates: List[Dict],
+        config_manager: BaseConfigurationManager,
+        search_space: Dict[str, ParameterRange],
+        metric_sign: int,
+    ) -> Dict:
+        """Select the next configuration to evaluate.
+
+        Scores all candidates by EI; if a local search algorithm is configured,
+        runs it to find a better point than the best candidate in the pool.
+
+        Args:
+            searcher: Fitted conformal searcher.
+            candidates: Random candidate pool. Must be non-empty.
+            config_manager: Configuration manager exposing ``tabularize_configs``.
+            search_space: Mapping from parameter name to ``ParameterRange``.
+            metric_sign: ``+1`` for minimization, ``-1`` for maximization.
+                Not used for EI scoring (the model and ``current_best_value``
+                are already in signed minimization space). Forwarded to the
+                local search algorithm solely so it can rank raw historical
+                performances when selecting epicenter / start-point candidates.
+
+        Returns:
+            Selected configuration dict.
+        """
+        X = config_manager.tabularize_configs(candidates)
+        scores = self.score(searcher, X)
+        if self.local_search_algorithm is None:
+            optimum = candidates[int(np.argmin(scores))]
+        else:
+            optimum = self.local_search_algorithm.optimize(
+                searcher=searcher,
+                candidates=candidates,
+                config_manager=config_manager,
+                search_space=search_space,
+                metric_sign=metric_sign,
+            )
+        return optimum
