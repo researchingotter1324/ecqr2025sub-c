@@ -1,34 +1,3 @@
-"""SMAC-style one-exchange neighbourhood local search for acquisition function optimization.
-
-Translates the core local-search heuristic from SMAC (Sequential Model-Based Algorithm
-Configuration; Hutter et al., LION 2011) to the CCQR mixed-variable search space.
-
-Algorithm summary:
-
-1. Score all ``candidates`` with the acquisition function in a single batch call.
-
-2. Select start points: up to ``n_acq_starts`` configs from the candidate pool sorted
-   by acquisition value (ascending = better); up to ``n_historical_starts`` configs
-   from the evaluated history sorted by observed performance (metric_sign-adjusted).
-   Deduplicate, acquisition-ranked configs first.
-
-3. Per-trajectory neighbourhood walk:
-   - Generate ``obtain_n`` one-exchange neighbours of the current position each round:
-     Categoricals: all other choices; Continuous/Int: Gaussian perturbations.
-   - Score the batch in a single predict call.
-   - Strict improvement (acq < current): accept, reset obtain_n, stop scanning batch.
-   - Tie (acq == current, within tolerance): collect for plateau walk.
-   - No improvement: increment plateau counter; if equal-acq neighbours exist, move
-     to the first one. Double obtain_n up to vectorization_max_obtain.
-   - Terminate after n_steps_plateau_walk non-improving rounds or max_steps.
-
-4. Return the single best configuration found across all trajectories.
-
-References:
-    Hutter, F., Hoos, H. H., & Leyton-Brown, K. (2011). Sequential model-based
-    optimization for general algorithm configuration. LION 5.
-"""
-
 import itertools
 import logging
 from typing import Callable, Dict, List, Optional, Tuple
@@ -155,7 +124,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
 
     def optimize(
         self,
-        searcher,
+        predict_fn: Callable[[List[Config]], np.ndarray],
         candidates: List[Config],
         config_manager: BaseConfigurationManager,
         search_space: Dict[str, ParameterRange],
@@ -164,9 +133,9 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         """Run SMAC-style neighbourhood search and return the best configuration found.
 
         Args:
-            searcher: ``QuantileConformalSearcher`` instance; ``predict(X)``
-                returns acquisition values (lower-is-better) for a tabularized
-                feature matrix.
+            predict_fn: Callable that maps a list of configuration dicts to a
+                flat ``np.ndarray`` of acquisition values (lower-is-better).
+                Built by the sampler as a closure over its estimators.
             candidates: Random candidate pool. Must be non-empty.
             config_manager: Exposes ``tabularize_configs``, ``searched_configs``,
                 and ``searched_performances``.
@@ -186,7 +155,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         scales = natural_scales(search_space)
 
         def predict(cfgs: List[Config]) -> np.ndarray:
-            return np.asarray(searcher.predict(config_manager.tabularize_configs(cfgs))).flatten()
+            return np.asarray(predict_fn(cfgs)).flatten()
 
         acq_candidates = predict(candidates)
         baseline = float(np.min(acq_candidates))

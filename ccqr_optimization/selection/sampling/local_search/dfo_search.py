@@ -1,39 +1,3 @@
-"""Model-based derivative-free local search for acquisition function minimization.
-
-Implements the ``dfo3__adaptive_narrow`` algorithm: a trust-region DFO walk using a
-thin-plate RBF surrogate with BOBYQA-style ρ-ratio trust-region updates (Powell 2009;
-Conn, Scheinberg & Vicente 2009), a narrow initial trust region for fine-grained local
-refinement, and multi-start via diverse epicenter seeding.
-
-Mixed-variable handling:
-  - Continuous and integer dimensions: encoded to [0, 1]^d; L-BFGS-B minimizes
-    the fitted RBF model within the trust region.
-  - Categorical dimensions: enumerated via one-exchange neighbors; one independent
-    model minimization is run per categorical slice.
-
-Epicenter selection:
-  - X historical base epicenters from the evaluated history (best true performance).
-  - Y acquisition-best random base epicenters from the scored candidate pool.
-  - Both sets are diversity-filtered via Gower-distance NMS.
-  - Merged into a single priority list via Reciprocal Rank Fusion (Cormack et al.,
-    SIGIR 2009).
-
-Convention throughout: acquisition values are lower-is-better.
-
-References:
-    Powell, M. J. D. (2009). The BOBYQA algorithm for bound constrained optimization
-    without derivatives. DAMTP Report NA2009/06.
-
-    Conn, A. R., Scheinberg, K., & Vicente, L. N. (2009). Introduction to
-    Derivative-Free Optimization. SIAM.
-
-    Gower, J. C. (1971). A general coefficient of similarity and some of its
-    properties. Biometrics, 27(4), 857-871.
-
-    Cormack, G. V., Clarke, C. L. A., & Buettcher, S. (2009). Reciprocal rank
-    fusion outperforms condorcet and individual rank learning methods. SIGIR 2009.
-"""
-
 import logging
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -518,7 +482,7 @@ class DFOLocalSearch(BaseLocalSearchAlgorithm):
 
     def optimize(
         self,
-        searcher,
+        predict_fn: Callable[[List[Config]], np.ndarray],
         candidates: List[Config],
         config_manager: BaseConfigurationManager,
         search_space: Dict[str, ParameterRange],
@@ -527,8 +491,9 @@ class DFOLocalSearch(BaseLocalSearchAlgorithm):
         """Run DFO trust-region local search and return the best configuration found.
 
         Args:
-            searcher: ``QuantileConformalSearcher`` instance; ``predict(X)``
-                returns acquisition values (lower-is-better).
+            predict_fn: Callable that maps a list of configuration dicts to a
+                flat ``np.ndarray`` of acquisition values (lower-is-better).
+                Built by the sampler as a closure over its estimators.
             candidates: Random candidate pool. Must be non-empty.
             config_manager: Exposes ``tabularize_configs``, ``searched_configs``,
                 ``searched_performances``, and optionally ``searched_config_hashes``
@@ -554,8 +519,7 @@ class DFOLocalSearch(BaseLocalSearchAlgorithm):
         n_interp = max(d + 2, int(self.n_interp_multiplier * min_quad))
         scales = natural_scales(search_space)
 
-        def predict(cfgs: List[Config]) -> np.ndarray:
-            return searcher.predict(config_manager.tabularize_configs(cfgs))
+        predict = predict_fn
 
         calls_used = 0
         acq = predict(candidates)

@@ -1,36 +1,11 @@
-"""Conformal acquisition function backed by a quantile conformal estimator.
-
-``QuantileConformalSearcher`` is the single searcher class. It owns:
-
-  - The sampler (one of ``LowerBoundSampler``, ``PessimisticLowerBoundSampler``,
-    ``ExpectedImprovementSampler``, ``ThompsonSampler``).
-  - Fitting logic (quantile conformal estimator + optional point estimator).
-  - Prediction surfaces (``predict_intervals``, ``predict_point``, ``predict``).
-  - Coordination: ``select_next`` delegates to the sampler; ``update`` adapts
-    coverage levels after each observation.
-
-Dependency flow (top → bottom, no upward edges):
-
-    wrapping / utils
-         │
-         ▼
-    samplers / local_search
-         │
-         ▼
-    acquisition              (imports samplers for Sampler type and dispatch)
-         │
-         ▼
-    tuning
-"""
-
 import logging
-from typing import Dict, List, Literal, Optional, Protocol, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 from ccqr_optimization.selection.conformalization import QuantileConformalEstimator
-from ccqr_optimization.selection.estimation import initialize_estimator
+from ccqr_optimization.selection.estimation import PointEstimator, initialize_estimator
 from ccqr_optimization.selection.estimator_configuration import (
     QUANTILE_TO_POINT_ESTIMATOR_MAPPING,
 )
@@ -47,10 +22,6 @@ from ccqr_optimization.wrapping import ConformalBounds, ParameterRange
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_IG_SAMPLER_RANDOM_STATE = 1234
-
-PointEstimatorArchitecture = Literal["gbm", "rf", "knn", "kr", "pens"]
-
 Sampler = Union[
     LowerBoundSampler,
     ThompsonSampler,
@@ -59,57 +30,30 @@ Sampler = Union[
 ]
 
 
-class PointEstimator(Protocol):
-    """Minimal interface any point estimator must expose.
-
-    Satisfied by sklearn ``BaseEstimator`` subclasses, ``MedianQuantileWrapper``,
-    and any other object that can map a feature matrix to a 1-D prediction array.
-    """
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Return point predictions for ``X``, shape ``(n_samples,)``."""
-        ...
-
-
 class MedianQuantileWrapper:
-    """Adapter exposing a quantile estimator's median quantile as a point estimator."""
+    """Exposes a quantile estimator's median column as a point-prediction interface."""
 
-    def __init__(self, estimator: PointEstimator) -> None:
-        """
-        Args:
-            estimator: A fitted quantile estimator whose ``predict`` returns
-                an array of shape ``(n_samples, n_quantiles)``.
-        """
+    def __init__(self, estimator) -> None:
         self.estimator = estimator
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Return the first-quantile (median) predictions.
-
-        Args:
-            X: Input features, shape ``(n_samples, n_features)``.
-
-        Returns:
-            Median predictions, shape ``(n_samples,)``.
-        """
         return self.estimator.predict(X)[:, 0]
 
 
 class QuantileConformalSearcher:
     """Conformal acquisition function backed by a quantile conformal estimator.
 
-    Owns the full lifecycle: construction, fitting, prediction, candidate
-    selection, and post-observation state updates.
-
-    A point estimator is fit only when the sampler requires one:
-    ``LowerBoundSampler`` always needs one; ``ThompsonSampler`` needs one only
-    when ``enable_optimistic_sampling`` is True; all others do not.
+    Owns the full acquisition lifecycle: fitting, prediction, candidate selection,
+    and post-observation updates. Local search is configured directly on each
+    sampler instance; the searcher is not aware of it.
 
     Attributes:
         sampler: Active acquisition strategy.
         quantile_estimator_architecture: Architecture key for the quantile model.
         n_pre_conformal_trials: Minimum samples required for conformal mode.
         conformal_estimator: Fitted ``QuantileConformalEstimator``.
-        point_estimator: Optional fitted point estimator.
+        point_estimator: Optional fitted ``PointEstimator``. Present only when
+            the sampler requires point predictions.
         X_train: Training features from the most recent ``fit`` call.
         y_train: Training targets from the most recent ``fit`` call.
         last_beta: Most recent coverage feedback for single-alpha samplers.
@@ -129,7 +73,10 @@ class QuantileConformalSearcher:
         Args:
             quantile_estimator_architecture: Architecture registered in the estimator
                 registry; must support simultaneous multi-quantile estimation.
-            sampler: Acquisition strategy that defines scoring and selection behavior.
+            sampler: Acquisition strategy that defines how prediction intervals are
+                converted into acquisition scores. Attach a local search algorithm
+                directly to the sampler (e.g. ``LowerBoundSampler(local_search=SmacLocalSearch())``).
+                ``ThompsonSampler`` does not accept a local search.
             n_pre_conformal_trials: Minimum total samples required for conformal mode.
                 Below this threshold, direct quantile predictions are used.
             n_calibration_folds: Number of folds for cross-validation calibration.
@@ -197,14 +144,18 @@ class QuantileConformalSearcher:
                     random_state=random_state,
                 )
                 point_est.fit(X=X_normalized, y=y)
-                self.point_estimator = point_est
             else:
                 quantile_est = initialize_estimator(
                     estimator_architecture=self.quantile_estimator_architecture,
                     random_state=random_state,
                 )
                 quantile_est.fit(X=X_normalized, y=y, quantiles=[0.5])
-                self.point_estimator = MedianQuantileWrapper(quantile_est)
+                point_est = MedianQuantileWrapper(estimator=quantile_est)
+
+            self.point_estimator = PointEstimator(
+                estimator=point_est,
+                scaler=self.scaler,
+            )
 
         self.conformal_estimator.fit(
             X=X,
@@ -241,13 +192,12 @@ class QuantileConformalSearcher:
                 "predict_point called but no point estimator has been fit. "
                 "The configured sampler did not request a point estimator at fit() time."
             )
-        return self.point_estimator.predict(self.scaler.transform(X))
+        return self.point_estimator.predict(X)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Acquisition values (lower-is-better) for ``X``.
 
-        Delegates to ``self.sampler.score``. Entry point for local search
-        algorithms that score novel candidates during a neighbourhood walk.
+        Delegates to ``self.sampler.score``, passing the fitted estimators.
 
         Args:
             X: Candidate points, shape ``(n_candidates, n_features)``.
@@ -255,7 +205,19 @@ class QuantileConformalSearcher:
         Returns:
             Acquisition values, shape ``(n_candidates,)``.
         """
-        return self.sampler.score(self, X)
+        if isinstance(self.sampler, LowerBoundSampler):
+            return self.sampler.score(
+                conformal_estimator=self.conformal_estimator,
+                X=X,
+                point_estimator=self.point_estimator,
+            )
+        if isinstance(self.sampler, ThompsonSampler):
+            return self.sampler.score(
+                conformal_estimator=self.conformal_estimator,
+                X=X,
+                point_estimator=self.point_estimator,
+            )
+        return self.sampler.score(conformal_estimator=self.conformal_estimator, X=X)
 
     def calculate_betas(self, X: np.ndarray, y_true: float) -> List[float]:
         """Calculate coverage feedback for adaptive alpha updating.
@@ -278,22 +240,37 @@ class QuantileConformalSearcher:
     ) -> Dict:
         """Select the next configuration to evaluate.
 
-        Dispatches to the sampler's ``select_next`` with the full argument set.
-        All samplers accept the same signature; those that do not use
-        ``search_space`` or ``metric_sign`` ignore them.
+        Delegates to ``sampler.select_next``, passing the fitted estimators.
+        Local search (if configured on the sampler) is invoked internally.
 
         Args:
             candidates: Random candidate pool. Must be non-empty.
-            config_manager: Configuration manager exposing ``tabularize_configs``,
-                ``searched_configs``, and ``searched_performances``.
+            config_manager: Exposes ``tabularize_configs``, ``searched_configs``,
+                and ``searched_performances``.
             search_space: Mapping from parameter name to ``ParameterRange``.
             metric_sign: ``+1`` for minimization, ``-1`` for maximization.
 
         Returns:
             Selected configuration dict.
         """
+        if isinstance(self.sampler, ThompsonSampler):
+            return self.sampler.select_next(
+                conformal_estimator=self.conformal_estimator,
+                candidates=candidates,
+                config_manager=config_manager,
+                point_estimator=self.point_estimator,
+            )
+        if isinstance(self.sampler, LowerBoundSampler):
+            return self.sampler.select_next(
+                conformal_estimator=self.conformal_estimator,
+                candidates=candidates,
+                config_manager=config_manager,
+                search_space=search_space,
+                metric_sign=metric_sign,
+                point_estimator=self.point_estimator,
+            )
         return self.sampler.select_next(
-            searcher=self,
+            conformal_estimator=self.conformal_estimator,
             candidates=candidates,
             config_manager=config_manager,
             search_space=search_space,
@@ -313,17 +290,12 @@ class QuantileConformalSearcher:
             Tuple of ``(lower_bound, upper_bound)``.
 
         Raises:
-            ValueError: If the sampler does not use a single prediction interval,
-                or if the conformal estimator is not fitted.
+            ValueError: If the sampler does not use a single prediction interval.
         """
         if not isinstance(self.sampler, PessimisticLowerBoundSampler):
             raise ValueError(
                 "Interval retrieval only supported for PessimisticLowerBoundSampler "
                 "and LowerBoundSampler."
-            )
-        if self.conformal_estimator is None:
-            raise ValueError(
-                "Conformal estimator not initialized. Call fit() before getting interval."
             )
         intervals = self.predict_intervals(X.reshape(1, -1))
         return intervals[0].lower_bounds[0], intervals[0].upper_bounds[0]

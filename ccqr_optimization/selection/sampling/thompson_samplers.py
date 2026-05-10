@@ -1,19 +1,9 @@
-"""Thompson sampling strategy for conformal prediction acquisition.
-
-Implements Thompson sampling using quantile-based conformal prediction intervals
-as approximations to posterior distributions. Randomly draws values from
-prediction intervals to balance exploration and exploitation.
-
-Thompson sampling does not support local search. Its ``select_next`` accepts
-the full uniform signature shared by all samplers but ignores ``search_space``
-and ``metric_sign``.
-"""
-
 from typing import Dict, List, Literal, Optional
 
 import numpy as np
 
-from ccqr_optimization.utils.tracking import BaseConfigurationManager
+from ccqr_optimization.selection.conformalization import QuantileConformalEstimator
+from ccqr_optimization.selection.estimation import PointEstimator
 from ccqr_optimization.selection.sampling.utils import (
     flatten_conformal_bounds,
     initialize_multi_adapters,
@@ -21,7 +11,8 @@ from ccqr_optimization.selection.sampling.utils import (
     update_multi_interval_widths,
     validate_even_quantiles,
 )
-from ccqr_optimization.wrapping import ConformalBounds, ParameterRange
+from ccqr_optimization.utils.tracking import BaseConfigurationManager
+from ccqr_optimization.wrapping import ConformalBounds
 
 
 class ThompsonSampler:
@@ -45,16 +36,16 @@ class ThompsonSampler:
             adapter: Interval width adaptation strategy. ``"DtACI"`` is aggressive
                 multi-scale adaptation; ``"ACI"`` is conservative; ``None`` disables.
             enable_optimistic_sampling: When True, sampled values are capped by point
-                estimates to encourage exploitation of promising regions. Requires
-                the searcher to expose ``predict_point``.
+                estimates to encourage exploitation of promising regions. A
+                ``PointEstimator`` must be passed at ``score``/``select_next`` time.
         """
-        validate_even_quantiles(n_quantiles, "Thompson")
+        validate_even_quantiles(n_quantiles=n_quantiles, sampler_name="Thompson")
 
         self.n_quantiles = n_quantiles
         self.enable_optimistic_sampling = enable_optimistic_sampling
 
-        self.alphas = initialize_quantile_alphas(n_quantiles)
-        self.adapters = initialize_multi_adapters(self.alphas, adapter)
+        self.alphas = initialize_quantile_alphas(n_quantiles=n_quantiles)
+        self.adapters = initialize_multi_adapters(alphas=self.alphas, adapter=adapter)
 
     def fetch_alphas(self) -> List[float]:
         """Return current alpha values, ordered from lowest to highest confidence."""
@@ -66,7 +57,9 @@ class ThompsonSampler:
         Args:
             betas: Observed coverage rates for each interval, one per alpha level.
         """
-        self.alphas = update_multi_interval_widths(self.adapters, self.alphas, betas)
+        self.alphas = update_multi_interval_widths(
+            adapters=self.adapters, alphas=self.alphas, betas=betas
+        )
 
     def calculate_thompson_predictions(
         self,
@@ -77,7 +70,6 @@ class ThompsonSampler:
 
         Args:
             predictions_per_interval: ConformalBounds for each confidence level.
-                All bounds must have the same number of observations.
             point_predictions: Optional point estimates. When provided and
                 ``enable_optimistic_sampling`` is True, sampled values are capped
                 at point estimates to encourage exploitation.
@@ -85,7 +77,9 @@ class ThompsonSampler:
         Returns:
             Array of shape (n_observations,) with sampled predictions.
         """
-        all_bounds = flatten_conformal_bounds(predictions_per_interval)
+        all_bounds = flatten_conformal_bounds(
+            predictions_per_interval=predictions_per_interval
+        )
         n_observations = len(predictions_per_interval[0].lower_bounds)
         n_intervals = all_bounds.shape[1]
 
@@ -97,65 +91,62 @@ class ThompsonSampler:
 
         return sampled_bounds
 
-    def score(self, searcher, X: np.ndarray) -> np.ndarray:
+    def score(
+        self,
+        conformal_estimator: QuantileConformalEstimator,
+        X: np.ndarray,
+        point_estimator: Optional[PointEstimator] = None,
+    ) -> np.ndarray:
         """Thompson acquisition values for ``X`` (lower-is-better).
 
-        Used by ``select_next`` and by ``searcher.predict`` (which delegates to
-        this method). Note that Thompson sampling is stochastic, so repeated
-        calls on the same ``X`` return different scores.
-
-        The model is trained on ``metric_sign``-adjusted targets
-        (``metric_sign * raw_performance``), so sampled bounds are already in
-        signed minimization space — no additional sign flip is needed here.
-        For maximization, ``metric_sign = -1`` means lower sampled values
-        correspond to higher (better) raw performance.
-
-        When ``enable_optimistic_sampling`` is True, samples are capped from
-        above by the point estimate via ``np.minimum``. In minimization space
-        this prevents draws that are overly pessimistic (too high), encouraging
-        exploitation of regions the model predicts as low.
+        Stochastic: repeated calls on the same ``X`` return different scores.
+        When ``enable_optimistic_sampling`` is True, ``point_estimator`` must be
+        provided or sampled values will not be capped.
 
         Args:
-            searcher: Fitted conformal searcher. Must additionally support
-                ``predict_point`` when ``enable_optimistic_sampling`` is True.
+            conformal_estimator: Fitted ``QuantileConformalEstimator``.
             X: Tabularized candidate features, shape (n_candidates, n_features).
+            point_estimator: Fitted ``PointEstimator``. Required only when
+                ``enable_optimistic_sampling`` is True.
 
         Returns:
             Sampled bounds in signed minimization space, shape (n_candidates,).
-            Lower values are better; ``select_next`` uses ``argmin``.
         """
-        intervals = searcher.predict_intervals(X)
-        if self.enable_optimistic_sampling:
-            point_predictions = searcher.predict_point(X)
+        intervals = conformal_estimator.predict_intervals(X)
+        if self.enable_optimistic_sampling and point_estimator is not None:
+            point_predictions = point_estimator.predict(X)
         else:
             point_predictions = None
-        return self.calculate_thompson_predictions(intervals, point_predictions)
+        return self.calculate_thompson_predictions(
+            predictions_per_interval=intervals, point_predictions=point_predictions
+        )
 
     def select_next(
         self,
-        searcher,
+        conformal_estimator: QuantileConformalEstimator,
         candidates: List[Dict],
         config_manager: BaseConfigurationManager,
-        search_space: Dict[str, ParameterRange] = None,
-        metric_sign: int = None,
+        point_estimator: Optional[PointEstimator] = None,
     ) -> Dict:
-        """Select the next configuration to evaluate via Thompson sampling.
+        """Select the next configuration via Thompson sampling.
 
-        Thompson sampling does not support local search, so ``search_space``
-        and ``metric_sign`` are unused. Acquisition scores are directionally
-        correct without any ``metric_sign`` multiplication because the model
-        is trained on sign-adjusted targets (``metric_sign * raw_performance``).
+        Thompson sampling does not support local search. Returns the candidate
+        with the lowest sampled acquisition value.
 
         Args:
-            searcher: Fitted conformal searcher.
+            conformal_estimator: Fitted ``QuantileConformalEstimator``.
             candidates: Random candidate pool. Must be non-empty.
-            config_manager: Configuration manager exposing ``tabularize_configs``.
-            search_space: Unused. Accepted for interface uniformity.
-            metric_sign: Unused. Accepted for interface uniformity.
+            config_manager: Exposes ``tabularize_configs``.
+            point_estimator: Fitted ``PointEstimator``. Required only when
+                ``enable_optimistic_sampling`` is True.
 
         Returns:
             Selected configuration dict.
         """
         X = config_manager.tabularize_configs(candidates)
-        scores = self.score(searcher, X)
+        scores = self.score(
+            conformal_estimator=conformal_estimator,
+            X=X,
+            point_estimator=point_estimator,
+        )
         return candidates[int(np.argmin(scores))]

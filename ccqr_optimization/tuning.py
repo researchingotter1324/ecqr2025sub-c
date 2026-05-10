@@ -652,10 +652,8 @@ class ConformalTuner:
         for baseline data, then conformal prediction-guided optimization using uncertainty
         quantification to select promising configurations.
 
-        Local search is configured at sampler construction time via the
-        ``local_search_algorithm`` parameter on the sampler (e.g. ``LowerBoundSampler``,
-        ``PessimisticLowerBoundSampler``, ``ExpectedImprovementSampler``). Pass a
-        ``DFOLocalSearch`` or ``SmacLocalSearch`` instance::
+        Local search is configured on the sampler via the ``local_search``
+        parameter. Pass a ``DFOLocalSearch`` or ``SmacLocalSearch`` instance::
 
             from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
             from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
@@ -663,7 +661,7 @@ class ConformalTuner:
 
             searcher = QuantileConformalSearcher(
                 quantile_estimator_architecture="qrf",
-                sampler=LowerBoundSampler(local_search_algorithm=SmacLocalSearch()),
+                sampler=LowerBoundSampler(local_search=SmacLocalSearch()),
             )
             tuner.tune(searcher=searcher)
 

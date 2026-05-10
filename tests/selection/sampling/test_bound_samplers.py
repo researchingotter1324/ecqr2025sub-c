@@ -55,7 +55,7 @@ class TestPessimisticLowerBoundSampler:
 
         sampler.update_interval_width(beta=0.85)
 
-        mock_update.assert_called_once_with(sampler.adapter, original_alpha, 0.85)
+        mock_update.assert_called_once_with(adapter=sampler.adapter, alpha=original_alpha, beta=0.85)
         assert sampler.alpha == 0.12
 
     @patch("ccqr_optimization.selection.sampling.bound_samplers.update_single_interval_width")
@@ -67,7 +67,7 @@ class TestPessimisticLowerBoundSampler:
 
         sampler.update_interval_width(beta=0.85)
 
-        mock_update.assert_called_once_with(None, original_alpha, 0.85)
+        mock_update.assert_called_once_with(adapter=None, alpha=original_alpha, beta=0.85)
         assert sampler.alpha == 0.2
 
     @pytest.mark.parametrize("beta", [0.5, 0.75, 0.85, 0.95])
