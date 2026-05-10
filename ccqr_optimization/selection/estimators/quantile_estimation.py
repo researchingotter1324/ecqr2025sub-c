@@ -734,7 +734,10 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
                 # temp_gp.kernel_ is a Sum(base_kernel, WhiteKernel)
                 # Extract the optimized base kernel and the optimized noise level
                 self.kernel_ = temp_gp.kernel_.k1
-                self.noise_variance_ = temp_gp.kernel_.k2.noise_level
+                # The true optimized noise variance includes alpha_for_opt.
+                # We subtract self.alpha so that when self.alpha is added in _fit_gp,
+                # the total noise matches the optimized noise exactly.
+                self.noise_variance_ = temp_gp.kernel_.k2.noise_level + alpha_for_opt - self.alpha
             else:
                 self.kernel_ = temp_gp.kernel_
 
@@ -799,19 +802,24 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         K = self.kernel_(self.X_train_)
 
         # Add noise and regularization
-        K += (self.noise_variance_ + self.alpha) * np.eye(len(self.X_train_))
+        K[np.diag_indices(len(self.X_train_))] += self.noise_variance_ + self.alpha
 
         # Robust Cholesky decomposition with progressive regularization
         regularization_levels = [0, 1e-8, 1e-6, 1e-4, 1e-3]
+        
+        self.effective_noise_variance_ = self.noise_variance_ + self.alpha
 
         for reg in regularization_levels:
             try:
-                K_reg = K + reg * np.eye(len(self.X_train_)) if reg > 0 else K
+                K_reg = K.copy()
+                if reg > 0:
+                    K_reg[np.diag_indices(len(self.X_train_))] += reg
                 self.chol_factor_ = cholesky(K_reg, lower=True)
                 if reg > 0:
                     logging.warning(
                         f"Added regularization {reg} for numerical stability"
                     )
+                    self.effective_noise_variance_ += reg
                 break
             except LinAlgError:
                 if reg == regularization_levels[-1]:
@@ -824,8 +832,12 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
                 continue
 
         # Solve for alpha = K^-1 y using Cholesky decomposition
-        L_inv_y = solve_triangular(self.chol_factor_, self.y_train_, lower=True)
-        self.alpha_ = solve_triangular(self.chol_factor_.T, L_inv_y, lower=False)
+        # Optuna's math for alpha (cov_Y_Y_inv_Y)
+        self.alpha_ = solve_triangular(
+            self.chol_factor_.T,
+            solve_triangular(self.chol_factor_, self.y_train_, lower=True),
+            lower=False,
+        )
 
     def _fit_gp_eigendecomp(self, K: np.ndarray) -> None:
         """Fallback GP fitting using eigendecomposition for ill-conditioned matrices."""
@@ -837,8 +849,8 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
 
         # Use pseudo-inverse for fitting
         try:
-            K_inv = eigenvecs @ np.diag(1.0 / eigenvals) @ eigenvecs.T
-            self.alpha_ = K_inv @ self.y_train_
+            # More stable computation of K^-1 y avoiding explicit K_inv construction
+            self.alpha_ = eigenvecs @ ((eigenvecs.T @ self.y_train_) / eigenvals)
             # Store decomposition for prediction
             self.eigenvals_ = eigenvals
             self.eigenvecs_ = eigenvecs
@@ -905,13 +917,18 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         K_star = self.kernel_(X_norm, self.X_train_)
 
         if self.chol_factor_ is not None:
-            # Use Cholesky-based computation
-            y_mean = K_star @ self.alpha_
+            # Optuna's math for prediction
+            y_mean = np.dot(K_star, self.alpha_)
 
-            # Compute variance (in normalized space)
-            chol_solve = solve_triangular(self.chol_factor_, K_star.T, lower=True)
+            # V = K_star @ inv(C)
+            V = solve_triangular(
+                self.chol_factor_.T,
+                solve_triangular(self.chol_factor_, K_star.T, lower=True),
+                lower=False,
+            ).T
+            
             K_star_star = self.kernel_.diag(X_norm)
-            y_var = K_star_star - np.sum(chol_solve**2, axis=0)
+            y_var = K_star_star - np.sum(K_star * V, axis=1)
 
         else:
             # Use eigendecomposition fallback
@@ -930,13 +947,14 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         y_mean = y_mean * self.y_train_std_ + self.y_train_mean_
 
         # Ensure non-negative variance before denormalization
-        y_var = np.maximum(y_var, 1e-12)
+        y_var = np.maximum(y_var, 0.0)
 
         # Denormalize variance (transforms from normalized to original scale)
         y_var *= self.y_train_std_**2
 
         # Add noise variance in original scale for total predictive variance
-        y_var += self.noise_variance_ * self.y_train_std_**2
+        # The total noise variance assumed by the model includes alpha and any regularization
+        y_var += self.effective_noise_variance_ * self.y_train_std_**2
 
         return y_mean, y_var
 
