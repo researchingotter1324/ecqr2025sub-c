@@ -4,7 +4,6 @@ import numpy as np
 
 from ccqr_optimization.selection.conformalization import QuantileConformalEstimator
 from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
-from ccqr_optimization.selection.sampling.local_search.dfo_search import DFOLocalSearch
 from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.sampling.utils import (
     flatten_conformal_bounds,
@@ -35,7 +34,7 @@ class ExpectedImprovementSampler:
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
         current_best_value: float = float("inf"),
         num_ei_samples: int = 20,
-        local_search: Optional[Union[DFOLocalSearch, SmacLocalSearch]] = None,
+        local_search: Optional[SmacLocalSearch] = None,
     ) -> None:
         """
         Args:

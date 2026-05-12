@@ -653,7 +653,7 @@ class ConformalTuner:
         quantification to select promising configurations.
 
         Local search is configured on the sampler via the ``local_search``
-        parameter. Pass a ``DFOLocalSearch`` or ``SmacLocalSearch`` instance::
+        parameter. Pass a ``SmacLocalSearch`` instance::
 
             from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
             from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler

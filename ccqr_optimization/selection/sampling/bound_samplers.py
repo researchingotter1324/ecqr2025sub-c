@@ -5,7 +5,6 @@ import numpy as np
 from ccqr_optimization.selection.conformalization import QuantileConformalEstimator
 from ccqr_optimization.selection.estimation import PointEstimator
 from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
-from ccqr_optimization.selection.sampling.local_search.dfo_search import DFOLocalSearch
 from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.sampling.utils import (
     initialize_single_adapter,
@@ -26,7 +25,7 @@ class PessimisticLowerBoundSampler:
         self,
         interval_width: float = 0.8,
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
-        local_search: Optional[Union[DFOLocalSearch, SmacLocalSearch]] = None,
+        local_search: Optional[SmacLocalSearch] = None,
     ) -> None:
         """
         Args:
@@ -146,7 +145,7 @@ class LowerBoundSampler(PessimisticLowerBoundSampler):
         ] = "logarithmic_decay",
         c: float = 1,
         beta_max: float = 10,
-        local_search: Optional[Union[DFOLocalSearch, SmacLocalSearch]] = None,
+        local_search: Optional[SmacLocalSearch] = None,
     ) -> None:
         """
         Args:

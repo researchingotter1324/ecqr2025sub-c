@@ -6,12 +6,10 @@ import numpy as np
 
 from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
-from ccqr_optimization.selection.sampling.local_search.dfo_search import (
-    natural_scales,
-    perturb_one,
-)
 from ccqr_optimization.wrapping import (
     CategoricalRange,
+    FloatRange,
+    IntRange,
     ParameterRange,
 )
 
@@ -20,6 +18,84 @@ logger = logging.getLogger(__name__)
 Config = Dict
 
 EQ_TOL = 1e-10
+SQRT12 = np.sqrt(12.0)
+
+def natural_scales(space: Dict[str, ParameterRange]) -> Dict[str, float]:
+    """Exact uninformative perturbation scale per non-categorical parameter.
+
+    Derived from the parameter's parent distribution std:
+      Uniform(min, max):           sigma = (max - min) / sqrt(12)
+      LogUniform(min, max) in log: sigma = (log max - log min) / sqrt(12)
+
+    Args:
+        space: Search space parameter descriptors.
+
+    Returns:
+        Mapping from parameter name to natural scale (only non-categorical params).
+    """
+    out: Dict[str, float] = {}
+    for name, p in space.items():
+        if isinstance(p, CategoricalRange):
+            continue
+        floor = 1e-10 if isinstance(p, FloatRange) else 1
+        span = (
+            (np.log(p.max_value) - np.log(max(p.min_value, floor)))
+            if p.log_scale
+            else (p.max_value - p.min_value)
+        )
+        out[name] = span / SQRT12
+    return out
+
+def perturb_one(
+    config: Config,
+    name: str,
+    p: ParameterRange,
+    natural_scale: float,
+    scale: float,
+    rng: np.random.Generator,
+) -> Config:
+    """Return a copy of ``config`` with exactly one parameter perturbed.
+
+    Args:
+        config: Source configuration to copy and perturb.
+        name: Name of the parameter to perturb.
+        p: ParameterRange descriptor for that parameter.
+        natural_scale: Pre-computed natural scale for the parameter.
+        scale: Trust-region scale factor applied to the noise magnitude.
+        rng: NumPy random generator instance.
+
+    Returns:
+        New configuration dict differing from ``config`` in exactly one dimension.
+    """
+    out = config.copy()
+    cur = config[name]
+    if isinstance(p, CategoricalRange):
+        choices = [c for c in p.choices if c != cur]
+        if choices:
+            out[name] = choices[rng.integers(0, len(choices))]
+    elif isinstance(p, FloatRange):
+        noise = rng.standard_normal() * scale * natural_scale
+        if p.log_scale:
+            lo, hi = np.log(max(p.min_value, 1e-10)), np.log(p.max_value)
+            raw = float(np.exp(np.clip(np.log(max(cur, 1e-10)) + noise, lo, hi)))
+        else:
+            raw = float(cur + noise)
+        out[name] = float(min(p.max_value, max(p.min_value, raw)))
+    elif isinstance(p, IntRange):
+        noise = rng.standard_normal() * scale * natural_scale
+        if p.log_scale:
+            lo, hi = np.log(max(p.min_value, 1)), np.log(p.max_value)
+            new = int(round(np.exp(np.clip(np.log(max(cur, 1)) + noise, lo, hi))))
+            if new == cur:
+                new = cur + (1 if rng.random() > 0.5 else -1)
+        else:
+            delta = int(round(noise))
+            if delta == 0:
+                delta = 1 if rng.random() > 0.5 else -1
+            new = cur + delta
+        out[name] = int(min(p.max_value, max(p.min_value, new)))
+    return out
+
 
 
 def one_exchange_neighborhood(
