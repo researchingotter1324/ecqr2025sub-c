@@ -1,4 +1,5 @@
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional
+
 
 import numpy as np
 
@@ -15,13 +16,58 @@ from ccqr_optimization.selection.sampling.utils import (
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
 from ccqr_optimization.wrapping import ConformalBounds, ParameterRange
 
+_EI_ZERO_THRESHOLD = 1e-10
+
+def discretized_ei(
+    quantile_values: np.ndarray,
+    quantile_levels: np.ndarray,
+    target: float,
+) -> np.ndarray:
+    """Compute discretized quantile expected improvement for minimization.
+
+    Implements:
+
+        EI_hat(x) = sum_{i=1}^{n-1} h_i * A_min(q_i(x), q_{i+1}(x); f*)
+
+    where h_i = u_{i+1} - u_i and A_min is the piecewise contribution:
+
+        A_min(a, b; f*) = f* - (a+b)/2       if b <= f*   (whole segment improves)
+                        = 0                   if a >= f*   (no improvement)
+                        = (f*-a)^2 / 2(b-a)  if a < f* < b (partial crossing)
+
+    Args:
+        quantile_values: Predicted quantiles in ascending order,
+            shape (n_candidates, n_quantiles).
+        quantile_levels: Quantile levels in ascending order, shape (n_quantiles,).
+        target: Current best (target) value f*.
+
+    Returns:
+        EI values, shape (n_candidates,). All values are non-negative.
+    """
+    prob_masses = np.diff(quantile_levels)
+    left_vals = quantile_values[:, :-1]
+    right_vals = quantile_values[:, 1:]
+
+    contrib_full = target - (left_vals + right_vals) / 2.0
+
+    denom = np.where(right_vals > left_vals, right_vals - left_vals, 1.0)
+    contrib_cross = (np.maximum(target - left_vals, 0.0) ** 2) / (2.0 * denom)
+
+    contribution = np.where(
+        right_vals <= target,
+        contrib_full,
+        np.where(left_vals >= target, 0.0, contrib_cross),
+    )
+
+    return np.sum(prob_masses * contribution, axis=1)
+
 
 class ExpectedImprovementSampler:
     """Expected Improvement acquisition strategy using conformal prediction intervals.
 
-    EI is estimated via Monte Carlo sampling from quantile-based conformal
-    prediction intervals, providing a principled exploration-exploitation
-    balance without explicit posterior models.
+    EI is approximated via discretized integration over predicted quantiles of the
+    conditional predictive distribution, with intra-quantile linear interpolation.
+    No extrapolation is performed beyond the outermost supplied quantiles.
 
     Holds an optional local search algorithm. When ``local_search`` is set,
     ``select_next`` runs the algorithm to refine the best candidate from the
@@ -33,7 +79,7 @@ class ExpectedImprovementSampler:
         n_quantiles: int = 4,
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
         current_best_value: float = float("inf"),
-        num_ei_samples: int = 20,
+        target_type: Literal["incumbent", "median"] = "incumbent",
         local_search: Optional[SmacLocalSearch] = None,
     ) -> None:
         """
@@ -44,7 +90,9 @@ class ExpectedImprovementSampler:
                 multi-scale adaptation; ``"ACI"`` is conservative; ``None`` disables.
             current_best_value: Initial best observed value for improvement computation.
                 Updated automatically via ``update_best_value``.
-            num_ei_samples: Number of Monte Carlo samples for EI estimation. Typical: 10-50.
+            target_type: The target value to pitch the expected improvement against.
+                ``"incumbent"`` uses the absolute best value observed so far.
+                ``"median"`` uses the median of all observed values (a softer target).
             local_search: Optional local search algorithm applied after initial candidate
                 scoring. ``None`` returns the best-scored candidate from the random pool
                 directly.
@@ -53,14 +101,20 @@ class ExpectedImprovementSampler:
 
         self.n_quantiles = n_quantiles
         self.current_best_value = current_best_value
-        self.num_ei_samples = num_ei_samples
+        self.target_type = target_type
         self.local_search: Optional[BaseLocalSearchAlgorithm] = local_search
 
         self.alphas = initialize_quantile_alphas(n_quantiles=n_quantiles)
         self.adapters = initialize_multi_adapters(alphas=self.alphas, adapter=adapter)
 
+        self.ei_score_history: List[np.ndarray] = []
+        self.y_history: List[float] = []
+
+        self.last_ei_collapsed: Optional[int] = None
+        self.last_perc_zero_ei: Optional[float] = None
+
     def update_best_value(self, value: float) -> None:
-        """Update the current best observed value.
+        """Update the current best observed value and historical values.
 
         ``value`` must be in signed minimization space (i.e.
         ``metric_sign * raw_performance``), matching the space in which the
@@ -70,6 +124,7 @@ class ExpectedImprovementSampler:
             value: Newly observed signed performance (``metric_sign * raw``).
         """
         self.current_best_value = min(self.current_best_value, value)
+        self.y_history.append(value)
 
     def fetch_alphas(self) -> List[float]:
         """Return current alpha values, ordered from lowest to highest confidence."""
@@ -85,43 +140,46 @@ class ExpectedImprovementSampler:
             adapters=self.adapters, alphas=self.alphas, betas=betas
         )
 
+    def get_target_value(self) -> float:
+        """Determine the target value for expected improvement based on target_type."""
+        if self.target_type == "median" and self.y_history:
+            return float(np.percentile(self.y_history, 50.0))
+
+        return self.current_best_value
+
     def calculate_expected_improvement(
         self,
         predictions_per_interval: List[ConformalBounds],
     ) -> np.ndarray:
-        """Calculate Expected Improvement for each candidate via Monte Carlo sampling.
+        """Calculate Expected Improvement for each candidate.
 
-        Methodology:
-            1. Flatten prediction intervals into a matrix representation.
-            2. Randomly sample from intervals for each observation.
-            3. Compute improvements: ``max(0, current_best - sampled_value)``.
-               Because the model is trained on ``metric_sign``-adjusted targets
-               and ``current_best_value`` is maintained in the same signed space,
-               no additional ``metric_sign`` multiplication is needed.
-            4. Estimate EI as the sample mean across draws.
-            5. Return negated EI so that lower values indicate higher improvement
-               (lower-is-better convention).
+        Implements the discretized quantile EI approximation for minimization.
 
         Args:
             predictions_per_interval: ConformalBounds for each confidence level,
-                in signed minimization space.
+                outermost first, in signed minimization space.
 
         Returns:
             Array of shape (n_observations,) with negated EI (lower-is-better).
         """
         all_bounds = flatten_conformal_bounds(predictions_per_interval=predictions_per_interval)
-        n_observations = len(predictions_per_interval[0].lower_bounds)
 
-        idxs = np.random.randint(0, all_bounds.shape[1], size=(n_observations, self.num_ei_samples))
+        if np.isinf(self.current_best_value) and self.current_best_value > 0:
+            return np.full(all_bounds.shape[0], -np.inf)
 
-        realizations = np.zeros((n_observations, self.num_ei_samples))
-        for i in range(n_observations):
-            realizations[i] = all_bounds[i, idxs[i]]
+        quantile_values = np.sort(all_bounds, axis=1)
+        quantile_levels = np.linspace(
+            1 / (self.n_quantiles + 1), self.n_quantiles / (self.n_quantiles + 1), self.n_quantiles
+        )
 
-        improvements = np.maximum(0, self.current_best_value - realizations)
-        expected_improvements = np.mean(improvements, axis=1)
+        target = self.get_target_value()
+        ei = discretized_ei(
+            quantile_values=quantile_values,
+            quantile_levels=quantile_levels,
+            target=target,
+        )
 
-        return -expected_improvements
+        return -ei
 
     def score(
         self,
@@ -138,7 +196,9 @@ class ExpectedImprovementSampler:
             Negated EI, shape (n_candidates,).
         """
         intervals = conformal_estimator.predict_intervals(X)
-        return self.calculate_expected_improvement(predictions_per_interval=intervals)
+        ei_scores = self.calculate_expected_improvement(predictions_per_interval=intervals)
+        self.ei_score_history.append(-ei_scores)
+        return ei_scores
 
     def select_next(
         self,
@@ -168,7 +228,9 @@ class ExpectedImprovementSampler:
         X = config_manager.tabularize_configs(candidates)
         scores = self.score(conformal_estimator=conformal_estimator, X=X)
         if self.local_search is None:
-            optimum = candidates[int(np.argmin(scores))]
+            winner_idx = int(np.argmin(scores))
+            optimum = candidates[winner_idx]
+            winner_ei = -scores[winner_idx]
         else:
             def predict_fn(cfgs: List[Dict]) -> np.ndarray:
                 return self.score(
@@ -183,4 +245,16 @@ class ExpectedImprovementSampler:
                 search_space=search_space,
                 metric_sign=metric_sign,
             )
+            winner_score = self.score(
+                conformal_estimator=conformal_estimator,
+                X=config_manager.tabularize_configs([optimum]),
+            )
+            winner_ei = -winner_score[0]
+
+        self.last_ei_collapsed = 1 if winner_ei <= _EI_ZERO_THRESHOLD else 0
+
+        all_ei = np.concatenate(self.ei_score_history)
+        n_zero = int(np.sum(all_ei <= _EI_ZERO_THRESHOLD))
+        self.last_perc_zero_ei = 100.0 * n_zero / len(all_ei)
+
         return optimum

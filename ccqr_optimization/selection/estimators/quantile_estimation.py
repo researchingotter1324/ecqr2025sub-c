@@ -17,6 +17,8 @@ from sklearn.base import clone
 from abc import ABC, abstractmethod
 from scipy.stats import norm
 from scipy.linalg import solve_triangular, cholesky, LinAlgError
+from sklearn.preprocessing import SplineTransformer
+from sklearn.linear_model import QuantileRegressor as SKLearnQuantileRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process.kernels import (
@@ -28,6 +30,7 @@ from sklearn.gaussian_process.kernels import (
     Kernel,
     WhiteKernel,
 )
+from sklearn.utils.validation import check_array
 import warnings
 import copy
 import logging
@@ -1237,3 +1240,333 @@ class QuantileLeaf(BaseSingleFitQuantileEstimator):
         fraction = np.where(denom > 0, (quantiles_arr[None, :] - cdf_lo) / safe_denom, 0.0)
 
         return y_lo + fraction * (y_hi - y_lo)
+
+
+class SplineQuantRegWrapper:
+    """Fitted single-quantile spline-GAM model.
+
+    Stores the intercept separately from spline/binary coefficients so the
+    intercept is never subject to L1 regularization.
+
+    Args:
+        coef_: Coefficient vector for spline + binary features, shape (n_design,).
+        intercept_: Scalar intercept (0.0 when ``add_intercept=False``).
+        spline_transformer: Fitted ``SplineTransformer`` applied to continuous columns.
+        continuous_cols: Integer indices of continuous feature columns.
+        binary_cols: Integer indices of binary (passthrough) feature columns.
+        add_intercept: Whether an intercept was fitted.
+    """
+
+    def __init__(
+        self,
+        coef_: np.ndarray,
+        intercept_: float,
+        spline_transformer: SplineTransformer,
+        continuous_cols: np.ndarray,
+        binary_cols: np.ndarray,
+        add_intercept: bool,
+    ):
+        self.coef_ = np.asarray(coef_, dtype=np.float64)
+        self.intercept_ = float(intercept_)
+        self.spline_transformer = spline_transformer
+        self.continuous_cols = continuous_cols
+        self.binary_cols = binary_cols
+        self.add_intercept = add_intercept
+        self.n_features_in_: int = len(continuous_cols) + len(binary_cols)
+        self.design_n_features_: int = len(self.coef_)
+
+        _p = (
+            np.concatenate([[self.intercept_], self.coef_])
+            if add_intercept
+            else self.coef_
+        )
+
+        class _Result:
+            def __init__(self, params: np.ndarray):
+                self.params = params
+
+        self.result = _Result(_p)
+
+    def _transform_X(self, X: np.ndarray) -> np.ndarray:
+        """Build the feature matrix from raw inputs.
+
+        Args:
+            X: Raw features, shape (n_samples, n_features).
+
+        Returns:
+            Feature matrix, shape (n_samples, design_n_features_).
+        """
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        parts = []
+        if len(self.continuous_cols) > 0:
+            parts.append(self.spline_transformer.transform(X[:, self.continuous_cols]))
+        if len(self.binary_cols) > 0:
+            parts.append(X[:, self.binary_cols].astype(np.float64))
+        if not parts:
+            return np.zeros((len(X), 0), dtype=np.float64)
+        return np.concatenate(parts, axis=1)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return quantile predictions.
+
+        Args:
+            X: Features, shape (n_samples, n_features).
+
+        Returns:
+            Predictions, shape (n_samples,).
+        """
+        return self._transform_X(X) @ self.coef_ + self.intercept_
+
+
+class SplineQuantileRegressor(BaseMultiFitQuantileEstimator):
+    """Per-quantile spline GAM using B-spline expansion of continuous features.
+
+    Fits one independent quantile regression model per requested quantile level.
+    Continuous input features are expanded into B-spline basis functions using
+    :class:`~sklearn.preprocessing.SplineTransformer`; binary (0/1) columns
+    pass through unchanged. Binary columns are detected automatically.
+
+    The intercept is always fitted without L1 regularization, preventing
+    predictions from collapsing toward the training mean when ``alpha > 0``.
+
+    Args:
+        n_knots: Number of knots per continuous feature.
+        degree: Polynomial degree of the B-splines (default 3 = cubic).
+        knots: Knot placement strategy passed to ``SplineTransformer``.
+            ``"quantile"`` places knots at equal quantiles of the training
+            distribution; ``"uniform"`` spaces them evenly over the range.
+        extrapolation: Extrapolation strategy passed to ``SplineTransformer``
+            (``"linear"``, ``"constant"``, ``"continue"``, or ``"periodic"``).
+        include_bias: Whether to include a bias column in the spline basis.
+        binary_threshold: Tolerance for binary-column detection.
+        add_intercept: Whether to fit an unregularized intercept term.
+        alpha: L1 regularization strength on spline/binary coefficients.
+            The intercept is always exempt from regularization.
+        solver: Backend solver. ``"highs"`` uses HiGHS interior-point LP via
+            ``sklearn.linear_model.QuantileRegressor``; ``"statsmodels"`` uses
+            IRLS with a coordinate-descent fallback.
+        max_iter: Maximum solver iterations.
+        p_tol: Convergence tolerance (statsmodels IRLS only).
+        monotone_rearrange: Apply monotone rearrangement to prevent quantile
+            crossing (inherited from :class:`BaseMultiFitQuantileEstimator`).
+        random_state: Random seed (reserved for reproducibility).
+
+    Attributes:
+        binary_cols_: Integer array of detected binary column indices.
+        continuous_cols_: Integer array of detected continuous column indices.
+        trained_estimators: List of :class:`SplineQuantRegWrapper`, one per quantile.
+        quantiles: Quantile levels passed to ``fit``.
+    """
+
+    def __init__(
+        self,
+        n_knots: int = 6,
+        degree: int = 3,
+        knots: str = "quantile",
+        extrapolation: str = "linear",
+        include_bias: bool = False,
+        binary_threshold: float = 1e-12,
+        add_intercept: bool = True,
+        alpha: float = 0.001,
+        solver: str = "highs",
+        max_iter: int = 1000,
+        p_tol: float = 1e-6,
+        monotone_rearrange: bool = True,
+        random_state: Optional[int] = None,
+    ):
+        super().__init__()
+        self.n_knots = n_knots
+        self.degree = degree
+        self.knots = knots
+        self.extrapolation = extrapolation
+        self.include_bias = include_bias
+        self.binary_threshold = binary_threshold
+        self.add_intercept = add_intercept
+        self.alpha = alpha
+        self.solver = solver
+        self.max_iter = max_iter
+        self.p_tol = p_tol
+        self.monotone_rearrange = monotone_rearrange
+        self.random_state = random_state
+
+        self.binary_cols_: Optional[np.ndarray] = None
+        self.continuous_cols_: Optional[np.ndarray] = None
+        self.trained_estimators: list = []
+
+    def fit(self, X: np.ndarray, y: np.ndarray, quantiles: List[float]):
+        """Detect feature types then fit one model per quantile.
+
+        Args:
+            X: Training features, shape (n_samples, n_features).
+            y: Training targets, shape (n_samples,).
+            quantiles: Quantile levels strictly inside (0, 1).
+
+        Returns:
+            Self.
+
+        Raises:
+            ValueError: On invalid inputs.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        X = check_array(X, dtype=np.float64, ensure_2d=True)
+        y = np.asarray(y, dtype=np.float64).ravel()
+
+        if X.shape[0] != len(y):
+            raise ValueError(f"X has {X.shape[0]} rows but y has {len(y)} elements.")
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            raise ValueError("X contains NaN or Inf values.")
+        if np.any(np.isnan(y)) or np.any(np.isinf(y)):
+            raise ValueError("y contains NaN or Inf values.")
+
+        quantiles_arr = np.asarray(quantiles, dtype=np.float64)
+        if np.any(quantiles_arr <= 0.0) or np.any(quantiles_arr >= 1.0):
+            raise ValueError("All quantiles must be strictly inside (0, 1).")
+
+        n_features = X.shape[1]
+        binary_mask = np.zeros(n_features, dtype=bool)
+        for j in range(n_features):
+            col = X[:, j]
+            finite_vals = col[np.isfinite(col)]
+            unique_vals = np.unique(finite_vals)
+            binary_mask[j] = np.all(
+                np.isclose(unique_vals, 0, atol=self.binary_threshold)
+                | np.isclose(unique_vals, 1, atol=self.binary_threshold)
+            )
+
+        self.binary_cols_ = np.where(binary_mask)[0]
+        self.continuous_cols_ = np.where(~binary_mask)[0]
+
+        if len(self.continuous_cols_) == 0 and len(self.binary_cols_) == 0:
+            raise ValueError("X has no usable columns.")
+
+        return super().fit(X, y, list(quantiles_arr))
+
+    def _fit_quantile_estimator(
+        self, X: np.ndarray, y: np.ndarray, quantile: float
+    ) -> SplineQuantRegWrapper:
+        """Fit a single spline-GAM quantile model.
+
+        Args:
+            X: Training features, shape (n_samples, n_features).
+            y: Training targets, shape (n_samples,).
+            quantile: Quantile level in (0, 1).
+
+        Returns:
+            Fitted :class:`SplineQuantRegWrapper`.
+        """
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+
+        spline_transformer = SplineTransformer(
+            n_knots=self.n_knots,
+            degree=self.degree,
+            knots=self.knots,
+            include_bias=self.include_bias,
+            extrapolation=self.extrapolation,
+        )
+
+        feat_parts: list = []
+        if len(self.continuous_cols_) > 0:
+            feat_parts.append(spline_transformer.fit_transform(X[:, self.continuous_cols_]))
+        else:
+            spline_transformer.fit(np.zeros((len(y), 1)))
+
+        if len(self.binary_cols_) > 0:
+            feat_parts.append(X[:, self.binary_cols_].astype(np.float64))
+
+        X_features = (
+            np.concatenate(feat_parts, axis=1)
+            if feat_parts
+            else np.zeros((len(y), 0), dtype=np.float64)
+        )
+
+        if self.solver == "highs":
+            qr = SKLearnQuantileRegressor(
+                quantile=quantile,
+                alpha=self.alpha,
+                solver="highs-ipm",
+                solver_options={"maxiter": self.max_iter},
+                fit_intercept=self.add_intercept,
+            )
+            qr.fit(X_features, y)
+            coef_ = qr.coef_
+            intercept_ = float(qr.intercept_) if self.add_intercept else 0.0
+
+        elif self.solver == "statsmodels":
+            if self.add_intercept:
+                X_design = np.column_stack([np.ones(len(y)), X_features])
+            else:
+                X_design = X_features
+            try:
+                params = QuantReg(y, X_design).fit(
+                    q=quantile, max_iter=self.max_iter, p_tol=self.p_tol
+                ).params
+            except np.linalg.LinAlgError:
+                warnings.warn(
+                    f"QuantReg SVD failed for quantile {quantile}. "
+                    "Falling back to coordinate-descent solver."
+                )
+                params = self._coordinate_descent_qr(X_design, y, quantile)
+
+            if self.add_intercept:
+                intercept_ = float(params[0])
+                coef_ = params[1:]
+            else:
+                intercept_ = 0.0
+                coef_ = params
+        else:
+            raise ValueError(f"Unknown solver '{self.solver}'. Use 'highs' or 'statsmodels'.")
+
+        return SplineQuantRegWrapper(
+            coef_=coef_,
+            intercept_=intercept_,
+            spline_transformer=spline_transformer,
+            continuous_cols=self.continuous_cols_,
+            binary_cols=self.binary_cols_,
+            add_intercept=self.add_intercept,
+        )
+
+    def _coordinate_descent_qr(
+        self, X: np.ndarray, y: np.ndarray, quantile: float
+    ) -> np.ndarray:
+        """Coordinate-descent quantile regression (statsmodels fallback).
+
+        Args:
+            X: Design matrix, shape (n_samples, n_design_features).
+            y: Target values, shape (n_samples,).
+            quantile: Quantile level in (0, 1).
+
+        Returns:
+            Coefficient vector, shape (n_design_features,).
+        """
+        n_samples, n_features = X.shape
+        lambda_reg = 1e-6
+
+        try:
+            beta = np.linalg.solve(X.T @ X + lambda_reg * np.eye(n_features), X.T @ y)
+        except np.linalg.LinAlgError:
+            beta = np.zeros(n_features)
+
+        X_norms_sq = np.sum(X ** 2, axis=0) + lambda_reg
+
+        for _ in range(self.max_iter):
+            beta_old = beta.copy()
+            for j in range(n_features):
+                residual = y - X @ beta + X[:, j] * beta[j]
+                r_pos = residual >= 0
+                gradient = (
+                    -quantile * np.sum(X[r_pos, j])
+                    - (quantile - 1) * np.sum(X[~r_pos, j])
+                    + lambda_reg * beta[j]
+                )
+                beta[j] -= gradient / X_norms_sq[j]
+                if abs(beta[j]) < 1e-8:
+                    beta[j] = 0.0
+            if np.linalg.norm(beta - beta_old) < self.p_tol:
+                break
+
+        return beta

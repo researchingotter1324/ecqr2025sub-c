@@ -47,6 +47,8 @@ class ThompsonSampler:
         self.alphas = initialize_quantile_alphas(n_quantiles=n_quantiles)
         self.adapters = initialize_multi_adapters(alphas=self.alphas, adapter=adapter)
 
+        self.last_extreme_quantile_used: Optional[int] = None
+
     def fetch_alphas(self) -> List[float]:
         """Return current alpha values, ordered from lowest to highest confidence."""
         return self.alphas
@@ -77,19 +79,47 @@ class ThompsonSampler:
         Returns:
             Array of shape (n_observations,) with sampled predictions.
         """
-        all_bounds = flatten_conformal_bounds(
-            predictions_per_interval=predictions_per_interval
-        )
-        n_observations = len(predictions_per_interval[0].lower_bounds)
-        n_intervals = all_bounds.shape[1]
+        sampled_bounds, _ = self.sample_bounds(predictions_per_interval, point_predictions)
+        return sampled_bounds
 
-        idx = np.random.randint(0, n_intervals, size=n_observations)
-        sampled_bounds = np.array([all_bounds[i, idx[i]] for i in range(n_observations)])
+    def sample_bounds(
+        self,
+        predictions_per_interval: List[ConformalBounds],
+        point_predictions: Optional[np.ndarray] = None,
+    ) -> "tuple[np.ndarray, np.ndarray]":
+        """Sample one bound per observation and return both the values and column indices.
+
+        Args:
+            predictions_per_interval: ConformalBounds for each confidence level.
+            point_predictions: Optional point estimates for optimistic capping.
+
+        Returns:
+            Tuple of (sampled_bounds, col_indices), both shape (n_observations,).
+        """
+        all_bounds = flatten_conformal_bounds(predictions_per_interval=predictions_per_interval)
+        n_observations = all_bounds.shape[0]
+        n_cols = all_bounds.shape[1]
+
+        col_indices = np.random.randint(0, n_cols, size=n_observations)
+        sampled_bounds = np.array([all_bounds[i, col_indices[i]] for i in range(n_observations)])
 
         if self.enable_optimistic_sampling and point_predictions is not None:
             sampled_bounds = np.minimum(sampled_bounds, point_predictions)
 
-        return sampled_bounds
+        return sampled_bounds, col_indices
+
+    def record_extreme_quantile(self, col_indices: np.ndarray, winner_idx: int) -> None:
+        """Set ``last_extreme_quantile_used`` based on the winning column index.
+
+        Column 0 of the flattened bounds matrix holds the lowest quantile level
+        (widest interval's lower bound), which is the most optimistic value in
+        signed minimization space and is therefore treated as the extreme quantile.
+
+        Args:
+            col_indices: Column index drawn per observation during the last sample.
+            winner_idx: Index of the winning candidate (argmin of sampled scores).
+        """
+        self.last_extreme_quantile_used = 1 if col_indices[winner_idx] == 0 else 0
 
     def score(
         self,
@@ -113,10 +143,9 @@ class ThompsonSampler:
             Sampled bounds in signed minimization space, shape (n_candidates,).
         """
         intervals = conformal_estimator.predict_intervals(X)
-        if self.enable_optimistic_sampling and point_estimator is not None:
-            point_predictions = point_estimator.predict(X)
-        else:
-            point_predictions = None
+        point_predictions = point_estimator.predict(X) if (
+            self.enable_optimistic_sampling and point_estimator is not None
+        ) else None
         return self.calculate_thompson_predictions(
             predictions_per_interval=intervals, point_predictions=point_predictions
         )
@@ -130,8 +159,9 @@ class ThompsonSampler:
     ) -> Dict:
         """Select the next configuration via Thompson sampling.
 
-        Thompson sampling does not support local search. Returns the candidate
-        with the lowest sampled acquisition value.
+        Returns the candidate with the lowest sampled acquisition value. Sets
+        ``self.last_extreme_quantile_used`` to 1 if the winning score was drawn
+        from the most extreme quantile column, 0 otherwise.
 
         Args:
             conformal_estimator: Fitted ``QuantileConformalEstimator``.
@@ -144,9 +174,13 @@ class ThompsonSampler:
             Selected configuration dict.
         """
         X = config_manager.tabularize_configs(candidates)
-        scores = self.score(
-            conformal_estimator=conformal_estimator,
-            X=X,
-            point_estimator=point_estimator,
-        )
-        return candidates[int(np.argmin(scores))]
+        intervals = conformal_estimator.predict_intervals(X)
+        point_predictions = point_estimator.predict(X) if (
+            self.enable_optimistic_sampling and point_estimator is not None
+        ) else None
+
+        sampled_bounds, col_indices = self.sample_bounds(intervals, point_predictions)
+        winner_idx = int(np.argmin(sampled_bounds))
+        self.record_extreme_quantile(col_indices, winner_idx)
+
+        return candidates[winner_idx]

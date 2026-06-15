@@ -24,6 +24,8 @@ from ccqr_optimization.selection.acquisition import (
 from ccqr_optimization.selection.sampling.expected_improvement_samplers import (
     ExpectedImprovementSampler,
 )
+from ccqr_optimization.selection.sampling.local_search.mies_search import MiesLocalSearch
+from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.estimator_configuration import (
     QRF_NAME,
     QLEAF_NAME,
@@ -68,33 +70,6 @@ def stop_search(
             return True
 
     return False
-
-
-def validate_searcher_architecture_compatibility(searcher: QuantileConformalSearcher) -> None:
-    """Validate that searcher architecture and sampler combination is compatible.
-    
-    Raises RuntimeError if a tree-based quantile estimator is paired with 
-    ExpectedImprovementSampler, as tree models cannot extrapolate beyond 
-    training y-range and thus cannot provide non-zero expected improvement.
-    
-    Args:
-        searcher: The QuantileConformalSearcher instance to validate.
-        
-    Raises:
-        RuntimeError: If incompatible architecture-sampler combination detected.
-    """
-    tree_based_architectures = {QRF_NAME, QLEAF_NAME, QGBM_NAME}
-    if (
-        searcher.quantile_estimator_architecture in tree_based_architectures
-        and isinstance(searcher.sampler, ExpectedImprovementSampler)
-    ):
-        raise RuntimeError(
-            f"Incompatible architecture-sampler combination: "
-            f"'{searcher.quantile_estimator_architecture}' quantile estimator cannot be paired with "
-            f"ExpectedImprovementSampler. Tree-based quantile models are bounded by training data "
-            f"range and cannot provide non-zero expected improvement once the current best equals "
-            f"y_min_train. Use LowerBoundSampler, PessimisticLowerBoundSampler, or ThompsonSampler instead."
-        )
 
 
 class ConformalTuner:
@@ -518,7 +493,6 @@ class ConformalTuner:
             max_runtime: Maximum total runtime budget in seconds
             optimizer_framework: Parameter tuning strategy
         """
-        validate_searcher_architecture_compatibility(searcher)
         
         (
             progress_manager,
@@ -532,6 +506,12 @@ class ConformalTuner:
         tuning_count = 0
         searcher_retuning_frequency = conformal_retraining_frequency
         training_runtime = 0
+
+        if len(self.config_manager.searched_performances) > 0:
+            all_y = np.array(self.config_manager.searched_performances) * self.metric_sign
+            if isinstance(searcher.sampler, ExpectedImprovementSampler):
+                searcher.sampler.y_history = all_y.tolist()
+                searcher.sampler.current_best_value = np.min(all_y)
 
         for search_iter in range(conformal_max_searches):
             progress_manager.update_progress(
@@ -573,6 +553,11 @@ class ConformalTuner:
                 search_space=self.search_space,
                 metric_sign=self.metric_sign,
             )
+            extreme_quantile_used = getattr(
+                searcher.sampler, "last_extreme_quantile_used", None
+            )
+            ei_collapsed = getattr(searcher.sampler, "last_ei_collapsed", None)
+            perc_zero_ei = getattr(searcher.sampler, "last_perc_zero_ei", None)
 
             # Evaluate configuration
             performance, _ = self.evaluate_configuration(next_config)
@@ -618,6 +603,9 @@ class ConformalTuner:
                 searcher_runtime=training_runtime,
                 lower_bound=signed_lower_bound,
                 upper_bound=signed_upper_bound,
+                extreme_quantile_used=extreme_quantile_used,
+                ei_collapsed=ei_collapsed,
+                perc_zero_ei=perc_zero_ei,
             )
             self.study.append_trial(trial)
 
@@ -651,6 +639,12 @@ class ConformalTuner:
         Performs intelligent hyperparameter search through two phases: random exploration
         for baseline data, then conformal prediction-guided optimization using uncertainty
         quantification to select promising configurations.
+
+        When the searcher's sampler has local search enabled, the candidate pool
+        per conformal iteration is automatically capped to 1000 and the remainder
+        of ``n_candidates`` (i.e. ``n_candidates - 1000``) is allocated as the
+        per-iteration local search evaluation budget.  If ``n_candidates`` is at
+        most 1000 the full pool is used and no local search budget is imposed.
 
         Local search is configured on the sampler via the ``local_search``
         parameter. Pass a ``SmacLocalSearch`` instance::
@@ -724,6 +718,14 @@ class ConformalTuner:
                     c=1,
                 ),
             )
+
+        local_search = getattr(searcher.sampler, "local_search", None)
+        if local_search is not None:
+            local_search_budget = max(0, self.n_candidates - 1000)
+            if isinstance(local_search, SmacLocalSearch):
+                local_search.max_steps = local_search_budget
+            elif isinstance(local_search, MiesLocalSearch):
+                local_search.max_eval = local_search_budget
 
         self.initialize_tuning_resources()
         self.search_timer = RuntimeTracker()

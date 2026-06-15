@@ -58,9 +58,7 @@ class TestExpectedImprovementSampler:
         self, simple_conformal_bounds
     ):
         """Test EI values are negative for minimization compatibility."""
-        sampler = ExpectedImprovementSampler(
-            n_quantiles=4, num_ei_samples=20, current_best_value=0.1
-        )
+        sampler = ExpectedImprovementSampler(n_quantiles=4, current_best_value=0.1)
 
         ei_values = sampler.calculate_expected_improvement(simple_conformal_bounds)
 
@@ -69,18 +67,13 @@ class TestExpectedImprovementSampler:
         n_observations = len(simple_conformal_bounds[0].lower_bounds)
         assert ei_values.shape == (n_observations,)
 
-    def test_calculate_expected_improvement_deterministic_sampling(
+    def test_calculate_expected_improvement_deterministic(
         self, simple_conformal_bounds
     ):
-        """Test EI calculation consistency with fixed random seed."""
-        sampler = ExpectedImprovementSampler(n_quantiles=4, num_ei_samples=50)
+        """Test EI calculation is deterministic (no stochastic components)."""
+        sampler = ExpectedImprovementSampler(n_quantiles=4)
 
-        # Calculate EI with fixed seed
-        np.random.seed(42)
         ei_values1 = sampler.calculate_expected_improvement(simple_conformal_bounds)
-
-        np.random.seed(42)
         ei_values2 = sampler.calculate_expected_improvement(simple_conformal_bounds)
 
-        # Results should be identical with same seed
-        np.testing.assert_array_almost_equal(ei_values1, ei_values2)
+        np.testing.assert_array_equal(ei_values1, ei_values2)

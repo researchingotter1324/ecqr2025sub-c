@@ -16,6 +16,7 @@ from ccqr_optimization.selection.estimators.quantile_estimation import (
     QuantileLasso,
     QuantileGP,
     QuantileLeaf,
+    SplineQuantileRegressor,
 )
 from ccqr_optimization.wrapping import ParameterRange
 from ccqr_optimization.selection.estimators.ensembling import (
@@ -61,6 +62,7 @@ QKNN_NAME: str = "qknn"
 QL_NAME: str = "ql"
 QGP_NAME: str = "qgp"  # Gaussian Process Quantile Estimator
 QLEAF_NAME: str = "qleaf"
+SQR_NAME: str = "sqr"  # Spline Quantile Regressor
 
 # New ensemble estimator names
 QENS1_NAME: str = "qens1"  # Ensemble of QL + QKNN + QRF
@@ -425,6 +427,31 @@ ESTIMATOR_REGISTRY = {
                 },
             },
         ],
+    ),
+    SQR_NAME: EstimatorConfig(
+        estimator_name=SQR_NAME,
+        estimator_class=SplineQuantileRegressor,
+        default_params={
+            "n_knots": 6,
+            "degree": 3,
+            "knots": "quantile",
+            "extrapolation": "linear",
+            "include_bias": False,
+            "add_intercept": True,
+            "alpha": 0.001,
+            "solver": "highs",
+            "max_iter": 1000,
+            "p_tol": 1e-6,
+            "monotone_rearrange": True,
+            "random_state": None,
+        },
+        estimator_parameter_space={
+            "n_knots": IntRange(min_value=4, max_value=12),
+            "degree": CategoricalRange(choices=[2, 3]),
+            "alpha": FloatRange(min_value=1e-5, max_value=1e-2, log_scale=True),
+            "knots": CategoricalRange(choices=["quantile", "uniform"]),
+            "extrapolation": CategoricalRange(choices=["linear", "constant"]),
+        },
     ),
     # Add new quantile estimators
     QGP_NAME: EstimatorConfig(

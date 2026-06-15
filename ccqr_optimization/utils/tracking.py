@@ -137,6 +137,9 @@ class Trial(BaseModel):
     upper_bound: Optional[float] = None
     searcher_runtime: Optional[float] = None
     target_model_runtime: Optional[float] = None
+    extreme_quantile_used: Optional[int] = None
+    ei_collapsed: Optional[int] = None
+    perc_zero_ei: Optional[float] = None
 
 
 class Study:

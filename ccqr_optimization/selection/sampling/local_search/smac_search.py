@@ -256,7 +256,9 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             if self.max_steps is not None and global_steps >= self.max_steps:
                 break
 
-            remaining = None if self.max_steps is None else self.max_steps - global_steps
+            remaining = (
+                None if self.max_steps is None else self.max_steps - global_steps
+            )
             found, found_acq, steps_taken = self.walk(
                 predict_fn=predict,
                 start=start,
