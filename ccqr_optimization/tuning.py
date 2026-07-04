@@ -186,13 +186,16 @@ class ConformalTuner:
             )
             self.study.append_trial(trial)
 
-    def initialize_tuning_resources(self) -> None:
+    def initialize_tuning_resources(self, random_state: Optional[int] = None) -> None:
         """Initialize core optimization components and data structures.
 
         Sets up the study container for trial tracking, configuration manager for
         handling search space sampling, and processes any warm start configurations.
         The configuration manager uses the optimized incremental approach for
         maximum performance.
+
+        Args:
+            random_state: Random seed for reproducible configuration sampling.
         """
         self.study = Study(
             metric_optimization="minimize" if self.minimize else "maximize"
@@ -203,11 +206,13 @@ class ConformalTuner:
             self.config_manager = DynamicConfigurationManager(
                 search_space=self.search_space,
                 n_candidate_configurations=self.n_candidates,
+                random_state=random_state,
             )
         else:
             self.config_manager = StaticConfigurationManager(
                 search_space=self.search_space,
                 n_candidate_configurations=self.n_candidates,
+                random_state=random_state,
             )
 
         if self.warm_starts:
@@ -641,10 +646,10 @@ class ConformalTuner:
         quantification to select promising configurations.
 
         When the searcher's sampler has local search enabled, the candidate pool
-        per conformal iteration is automatically capped to 1000 and the remainder
-        of ``n_candidates`` (i.e. ``n_candidates - 1000``) is allocated as the
+        per conformal iteration is automatically capped to 2048 and the remainder
+        of ``n_candidates`` (i.e. ``n_candidates - 2048``) is allocated as the
         per-iteration local search evaluation budget.  If ``n_candidates`` is at
-        most 1000 the full pool is used and no local search budget is imposed.
+        most 2048 the full pool is used and no local search budget is imposed.
 
         Local search is configured on the sampler via the ``local_search``
         parameter. Pass a ``SmacLocalSearch`` instance::
@@ -721,13 +726,13 @@ class ConformalTuner:
 
         local_search = getattr(searcher.sampler, "local_search", None)
         if local_search is not None:
-            local_search_budget = max(0, self.n_candidates - 1000)
+            local_search_budget = max(0, self.n_candidates - 2048)
             if isinstance(local_search, SmacLocalSearch):
                 local_search.max_steps = local_search_budget
             elif isinstance(local_search, MiesLocalSearch):
                 local_search.max_eval = local_search_budget
 
-        self.initialize_tuning_resources()
+        self.initialize_tuning_resources(random_state=random_state)
         self.search_timer = RuntimeTracker()
 
         n_warm_starts = len(self.warm_starts) if self.warm_starts else 0

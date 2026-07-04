@@ -9,6 +9,7 @@ quantification in conformal prediction frameworks.
 
 from typing import Dict, List, Union, Optional
 import numpy as np
+from ccqr_optimization.utils.math import monotone_rearrange
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.ensemble._forest import _generate_sample_indices, _get_n_samples_bootstrap
 from sklearn.neighbors import NearestNeighbors
@@ -88,17 +89,7 @@ class BaseMultiFitQuantileEstimator(ABC):
         y_pred = np.column_stack(
             [estimator.predict(X) for estimator in self.trained_estimators]
         )
-        
-        # NOTE: Apply rearrangement method (Chernozhukov et al.) to prevent quantile crossing.
-        # This pointwise sorting guarantees monotonicity and reduces estimation error.
-        y_pred_sorted = np.sort(y_pred, axis=1)
-        
-        # Map sorted predictions back to the originally requested quantile order
-        sorted_idx = np.argsort(self.quantiles)
-        reverse_idx = np.empty_like(sorted_idx)
-        reverse_idx[sorted_idx] = np.arange(len(self.quantiles))
-        
-        return y_pred_sorted[:, reverse_idx]
+        return monotone_rearrange(y_pred, self.quantiles)
 
 
 class BaseSingleFitQuantileEstimator(ABC):

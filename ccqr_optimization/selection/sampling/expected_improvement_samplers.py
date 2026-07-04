@@ -13,6 +13,7 @@ from ccqr_optimization.selection.sampling.utils import (
     update_multi_interval_widths,
     validate_even_quantiles,
 )
+from ccqr_optimization.utils.math import monotone_rearrange
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
 from ccqr_optimization.wrapping import ConformalBounds, ParameterRange
 
@@ -167,7 +168,7 @@ class ExpectedImprovementSampler:
         if np.isinf(self.current_best_value) and self.current_best_value > 0:
             return np.full(all_bounds.shape[0], -np.inf)
 
-        quantile_values = np.sort(all_bounds, axis=1)
+        quantile_values = monotone_rearrange(all_bounds)
         quantile_levels = np.linspace(
             1 / (self.n_quantiles + 1), self.n_quantiles / (self.n_quantiles + 1), self.n_quantiles
         )

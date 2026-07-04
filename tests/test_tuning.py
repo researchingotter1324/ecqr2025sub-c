@@ -8,6 +8,7 @@ from ccqr_optimization.wrapping import CategoricalRange, IntRange
 from ccqr_optimization.utils.tracking import RuntimeTracker
 from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
 from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
+from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 
 
 def test_stop_search_no_remaining_configurations():
@@ -172,15 +173,23 @@ def test_tune_method_reproducibility(dummy_parameter_grid, random_state):
                 adapter="DtACI",
                 beta_decay="logarithmic_decay",
                 c=1,
+                local_search=SmacLocalSearch(
+                    n_acq_starts=10,
+                    n_historical_starts=6,
+                    n_steps_plateau_walk=10,
+                    max_steps=None,
+                    num_continuous_neighbors=8,
+                    stdev=0.2,
+                ),
             ),
-            n_pre_conformal_trials=5,
+            n_pre_conformal_trials=15,
         )
 
         tuner = ConformalTuner(
             objective_function=complex_objective,
             search_space=dummy_parameter_grid,
             minimize=True,
-            n_candidates=200,
+            n_candidates=10000,
         )
 
         tuner.tune(

@@ -58,3 +58,4 @@ alwaysApply: true
 - Avoid implicit behavior (e.g. input mutation, in-place dataframe modification).
 - No `print()` statements. Use logging.
 - Always leave one empty line before the return statement of a function or method.
+- No module doc strings at the top of the module.

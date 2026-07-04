@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 from typing import Optional, Tuple, List, Literal
+from ccqr_optimization.utils.math import monotone_rearrange
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from ccqr_optimization.wrapping import ConformalBounds
@@ -591,7 +592,23 @@ class QuantileConformalEstimator:
                 )
             )
 
-        return intervals
+        # Apply Chernozhukov monotone rearrangement across all conformalized quantiles.
+        all_bounds = []
+        quantile_levels = []
+        for i, alpha in enumerate(self.alphas):
+            lower_q, upper_q = alpha_to_quantiles(alpha)
+            all_bounds.extend([intervals[i].lower_bounds, intervals[i].upper_bounds])
+            quantile_levels.extend([lower_q, upper_q])
+
+        final_bounds = monotone_rearrange(np.column_stack(all_bounds), quantile_levels)
+
+        return [
+            ConformalBounds(
+                lower_bounds=final_bounds[:, 2 * i],
+                upper_bounds=final_bounds[:, 2 * i + 1],
+            )
+            for i in range(len(self.alphas))
+        ]
 
     def calculate_betas(self, X: np.array, y_true: float) -> list[float]:
         """Calculate empirical p-values (beta values) for conformity assessment.

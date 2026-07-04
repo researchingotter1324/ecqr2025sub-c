@@ -24,6 +24,8 @@ from ccqr_optimization.selection.estimators.ensembling import (
     QuantileEnsembleEstimator,
 )
 
+ENSEMBLE_CONSTRAIN_WEIGHTS: bool = True
+
 
 class EstimatorConfig(BaseModel):
     estimator_name: str
@@ -65,7 +67,7 @@ QLEAF_NAME: str = "qleaf"
 SQR_NAME: str = "sqr"  # Spline Quantile Regressor
 
 # New ensemble estimator names
-QENS1_NAME: str = "qens1"  # Ensemble of QL + QKNN + QRF
+QENS1_NAME: str = "qens1"  # Ensemble of SQR + QRF
 QENS2_NAME: str = "qens2"  # Ensemble of QL + QKNN + QGBM
 QENS3_NAME: str = "qens3"  # Ensemble of QRF + QL
 QENS4_NAME: str = "qens4"  # Ensemble of QRF + QGP
@@ -242,6 +244,7 @@ ESTIMATOR_REGISTRY = {
             "weighting_strategy": "linear_stack",
             "cv": 5,
             "alpha": 0.001,
+            "constrain_weights": ENSEMBLE_CONSTRAIN_WEIGHTS,
         },
         estimator_parameter_space={
             "weighting_strategy": CategoricalRange(choices=["uniform", "linear_stack"]),
@@ -249,28 +252,30 @@ ESTIMATOR_REGISTRY = {
         },
         ensemble_components=[
             {
-                "class": QuantileLasso,
+                "class": SplineQuantileRegressor,
                 "params": {
-                    "max_iter": 300,
-                    "p_tol": 1e-4,
+                    "n_knots": 6,
+                    "degree": 3,
+                    "knots": "quantile",
+                    "extrapolation": "linear",
+                    "include_bias": False,
+                    "add_intercept": True,
+                    "alpha": 0.001,
+                    "solver": "highs",
+                    "max_iter": 1000,
+                    "p_tol": 1e-6,
+                    "monotone_rearrange": True,
+                    "random_state": None,
                 },
             },
             {
-                "class": QuantileKNN,
+                "class": QuantileForest,
                 "params": {
-                    "n_neighbors": 6,
-                },
-            },
-            {
-                "class": QuantileGBM,
-                "params": {
-                    "learning_rate": 0.1,
                     "n_estimators": 50,
-                    "min_samples_split": 6,
-                    "min_samples_leaf": 1,
-                    "max_depth": 2,
-                    "subsample": 0.7,
+                    "max_depth": 4,
                     "max_features": 0.7,
+                    "min_samples_split": 4,
+                    "bootstrap": True,
                     "random_state": None,
                 },
             },
@@ -283,6 +288,7 @@ ESTIMATOR_REGISTRY = {
             "weighting_strategy": "linear_stack",
             "cv": 5,
             "alpha": 0.001,
+            "constrain_weights": ENSEMBLE_CONSTRAIN_WEIGHTS,
         },
         estimator_parameter_space={
             "weighting_strategy": CategoricalRange(choices=["uniform", "linear_stack"]),
@@ -322,6 +328,7 @@ ESTIMATOR_REGISTRY = {
             "weighting_strategy": "linear_stack",
             "cv": 5,
             "alpha": 0.001,
+            "constrain_weights": ENSEMBLE_CONSTRAIN_WEIGHTS,
         },
         estimator_parameter_space={
             "weighting_strategy": CategoricalRange(choices=["uniform", "linear_stack"]),
@@ -357,6 +364,7 @@ ESTIMATOR_REGISTRY = {
             "weighting_strategy": "linear_stack",
             "cv": 5,
             "alpha": 0.001,
+            "constrain_weights": ENSEMBLE_CONSTRAIN_WEIGHTS,
         },
         estimator_parameter_space={
             "weighting_strategy": CategoricalRange(choices=["uniform", "linear_stack"]),
@@ -392,6 +400,7 @@ ESTIMATOR_REGISTRY = {
             "weighting_strategy": "linear_stack",
             "cv": 5,
             "alpha": 0.001,
+            "constrain_weights": ENSEMBLE_CONSTRAIN_WEIGHTS,
         },
         estimator_parameter_space={
             "weighting_strategy": CategoricalRange(choices=["uniform", "linear_stack"]),
