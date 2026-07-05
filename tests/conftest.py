@@ -7,7 +7,8 @@ from ccqr_optimization.tuning import (
     ConformalTuner,
 )
 from ccqr_optimization.utils.configurations.sampling import get_tuning_configurations
-from ccqr_optimization.selection.acquisition import QuantileConformalSearcher, LowerBoundSampler
+from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
+from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
 from ccqr_optimization.wrapping import FloatRange, IntRange, CategoricalRange, ConformalBounds
 from sklearn.base import BaseEstimator
 from ccqr_optimization.selection.estimator_configuration import (

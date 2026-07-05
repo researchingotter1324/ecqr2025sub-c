@@ -1,25 +1,3 @@
-"""
-Utility functions for sampling strategies in conformal prediction.
-
-This module provides shared functionality used across different sampler implementations,
-including alpha initialization strategies, adapter configuration for interval width
-adjustment, and common preprocessing utilities. The module implements quantile-based
-alpha initialization following symmetric quantile pairing methodology and provides
-standardized interfaces for interval width adaptation using coverage rate feedback.
-
-Key architectural components:
-- Quantile-based alpha value initialization using symmetric pairing
-- Multi-adapter configuration for complex sampling strategies
-- Interval width update mechanisms with coverage rate feedback
-- Validation utilities for sampling parameter constraints
-- Conformal bounds preprocessing for efficient computation
-
-Integration context:
-The utilities in this module are designed to be used by all sampling strategy
-implementations, providing consistent interfaces for common operations while
-allowing each sampler to implement its specific acquisition logic.
-"""
-
 from typing import Optional, List, Literal
 import warnings
 from ccqr_optimization.selection.adaptation import DtACI

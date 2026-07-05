@@ -4,7 +4,8 @@ from typing import Dict, Tuple, Optional
 
 from ccqr_optimization.tuning import ConformalTuner
 from ccqr_optimization.wrapping import CategoricalRange
-from ccqr_optimization.selection.acquisition import QuantileConformalSearcher, LowerBoundSampler
+from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
+from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
 
 DRAW_OR_WIN_RATE_THRESHOLD = 0.75
 WINDOW_SIZE = 20

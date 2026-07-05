@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 from typing import Optional, Tuple, List, Literal
+from ccqr_optimization.utils.math import monotone_rearrange
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from ccqr_optimization.wrapping import ConformalBounds
@@ -50,15 +51,11 @@ def alpha_to_quantiles(alpha: float) -> Tuple[float, float]:
 
 
 class QuantileConformalEstimator:
-    """Quantile-based conformal predictor with adaptive splitting strategies.
+    """Quantile-based conformal predictor with configurable splitting strategies.
 
-    Implements conformal prediction for quantile regression with adaptive splitting
-    strategies (K-fold cross-validation, train-test split, or adaptive selection).
+    Implements conformal prediction for quantile regression using either K-fold
+    cross-validation (CV+) or a single train-test split for calibration. 
     The estimator supports both conformalized and non-conformalized modes.
-
-    The estimator supports both conformalized and non-conformalized modes:
-    - Conformalized: Conformal calibration for principled uncertainty quantification
-    - Non-conformalized: Direct quantile predictions (when data is limited)
 
     Args:
         quantile_estimator_architecture: Architecture identifier for quantile estimator.
@@ -82,10 +79,7 @@ class QuantileConformalEstimator:
         alphas: List[float],
         n_pre_conformal_trials: int = 32,
         n_calibration_folds: int = 3,
-        calibration_split_strategy: Literal[
-            "cv", "train_test_split", "adaptive"
-        ] = "adaptive",
-        adaptive_threshold: int = 50,
+        calibration_split_strategy: Literal["cv", "train_test_split"] = "cv",
         normalize_features: bool = True,
     ):
         self.quantile_estimator_architecture = quantile_estimator_architecture
@@ -94,7 +88,6 @@ class QuantileConformalEstimator:
         self.n_pre_conformal_trials = n_pre_conformal_trials
         self.n_calibration_folds = n_calibration_folds
         self.calibration_split_strategy = calibration_split_strategy
-        self.adaptive_threshold = adaptive_threshold
         self.normalize_features = normalize_features
 
         self.quantile_estimator = None
@@ -105,31 +98,6 @@ class QuantileConformalEstimator:
         self.last_best_params = None
         self.feature_scaler = None
         self.fold_estimators = []  # Store K-fold estimators for CV+
-
-    def _determine_splitting_strategy(self, total_size: int) -> str:
-        """Determine optimal data splitting strategy based on dataset size and configuration.
-
-        Selects between cross-validation (CV) and train-test split approaches for quantile-based conformal
-        calibration based on the configured strategy and dataset characteristics. The
-        adaptive strategy automatically chooses the most appropriate method based on
-        data size to balance computational efficiency with calibration stability.
-
-        Args:
-            total_size: Total number of samples in the dataset.
-
-        Returns:
-            Strategy identifier: "cv" or "train_test_split".
-
-        Strategy Selection Logic:
-            - "adaptive": Uses K-fold cross-validation for small datasets to improve
-              calibration stability, and switches to train-test split for larger
-              datasets to improve computational efficiency
-            - "cv": Always uses K-fold cross-validation-based calibration
-            - "train_test_split": Always uses single split calibration
-        """
-        if self.calibration_split_strategy == "adaptive":
-            return "cv" if total_size < self.adaptive_threshold else "train_test_split"
-        return self.calibration_split_strategy
 
     def _fit_non_conformal(
         self,
@@ -428,9 +396,10 @@ class QuantileConformalEstimator:
     ):
         """Fit the quantile conformal estimator.
 
-        Uses an adaptive data splitting strategy (K-fold cross-validation for small datasets,
-        train-test split for larger datasets) or explicit strategy selection. Handles data
-        preprocessing including feature scaling applied to the entire dataset.
+        Uses the strategy fixed at construction time (``calibration_split_strategy``,
+        either K-fold cross-validation or a single train-test split) for the entire
+        lifetime of the estimator. Handles data preprocessing including feature
+        scaling applied to the entire dataset.
 
         Args:
             X: Input features, shape (n_samples, n_features).
@@ -461,9 +430,7 @@ class QuantileConformalEstimator:
         use_conformal = total_size > self.n_pre_conformal_trials
 
         if use_conformal:
-            strategy = self._determine_splitting_strategy(total_size)
-
-            if strategy == "cv":
+            if self.calibration_split_strategy == "cv":
                 self._fit_cv_plus(
                     X_scaled,
                     y,
@@ -495,6 +462,100 @@ class QuantileConformalEstimator:
                 last_best_params,
             )
 
+    def build_augmented_calibration_arrays(
+        self, X_processed: np.ndarray, alpha_idx: int
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """Build the pooled CV+ calibration arrays for one alpha level.
+
+        For every held-out calibration point across every fold, pairs that
+        point's own fold estimator's prediction at ``X_processed`` with that
+        same point's nonconformity score to form the ``lower_value``/
+        ``upper_value`` arrays whose quantiles define the served interval
+        Ĉ_t(·) (Barber et al. CV+ construction). This reduces exactly to
+        standard split conformal when there is a single fold.
+
+        This is the single source of truth for Ĉ_t(·): both ``predict_intervals``
+        (which takes a quantile of these arrays at a specific alpha) and
+        ``calculate_betas`` (which inverts these arrays to find beta_t for an
+        observed y) must build them identically, otherwise the beta feedback
+        driving DtACI/ACI would not correspond to the interval actually served.
+
+        Args:
+            X_processed: Already-scaled input features, shape (n_points, n_features).
+            alpha_idx: Index into ``self.alphas``/``self.nonconformity_scores``.
+
+        Returns:
+            Tuple of ``(lower_values, upper_values, n_scores)`` where
+            ``lower_values``/``upper_values`` have shape ``(n_scores, n_points)``
+            and ``n_scores`` is the total pooled calibration sample size across
+            all folds.
+        """
+        lower_quantile, upper_quantile = alpha_to_quantiles(self.alphas[alpha_idx])
+        lower_idx = self.quantile_indices[lower_quantile]
+        upper_idx = self.quantile_indices[upper_quantile]
+
+        fold_score_groups = self.nonconformity_scores[alpha_idx]
+        n_scores = sum(len(fold_scores) for fold_scores in fold_score_groups)
+        n_points = X_processed.shape[0]
+
+        lower_values = np.empty((n_scores, n_points))
+        upper_values = np.empty((n_scores, n_points))
+
+        score_idx = 0
+        for fold_idx, fold_scores in enumerate(fold_score_groups):
+            fold_pred = self.fold_estimators[fold_idx].predict(X_processed)
+            n_fold_scores = len(fold_scores)
+
+            fold_lower_pred = fold_pred[:, lower_idx] 
+            fold_upper_pred = fold_pred[:, upper_idx] 
+            fold_scores_array = np.array(fold_scores).reshape(
+                -1, 1
+            )
+
+            lower_values[score_idx : score_idx + n_fold_scores] = (
+                fold_lower_pred - fold_scores_array
+            )
+            upper_values[score_idx : score_idx + n_fold_scores] = (
+                fold_upper_pred + fold_scores_array
+            )
+            score_idx += n_fold_scores
+
+        return lower_values, upper_values, n_scores
+
+    @staticmethod
+    def invert_beta_from_augmented_arrays(
+        lower_values_col: np.ndarray,
+        upper_values_col: np.ndarray,
+        y_true: float,
+        n_scores: int,
+    ) -> float:
+        """Invert beta_t := sup{beta : y_true in C_t(beta)} for a CV+/split set.
+
+        Given ``C_t(beta) = [Quantile(beta/(1+1/n), lower_values),
+        Quantile(1-beta/(1+1/n), upper_values)]`` (the same construction used
+        by ``predict_intervals``), both endpoints are monotone in beta (the
+        interval shrinks as beta grows), so beta_t is found by separately
+        inverting each side's empirical CDF and taking the tighter (min)
+        constraint. This exactly matches the paper's beta_t definition for
+        whichever conformal construction (split or CV+) produced C_t.
+
+        Args:
+            lower_values_col: Pooled lower-shifted calibration values for a
+                single candidate point, shape ``(n_scores,)``.
+            upper_values_col: Pooled upper-shifted calibration values for a
+                single candidate point, shape ``(n_scores,)``.
+            y_true: Observed target value.
+            n_scores: Total pooled calibration sample size (matches the
+                finite-sample correction factor used in ``predict_intervals``).
+
+        Returns:
+            beta_t, clipped to [0, 1].
+        """
+        finite_sample_factor = 1 + 1 / n_scores
+        beta_lower = finite_sample_factor * np.mean(lower_values_col <= y_true)
+        beta_upper = finite_sample_factor * np.mean(upper_values_col >= y_true)
+        return float(np.clip(min(beta_lower, beta_upper), 0.0, 1.0))
+
     def predict_intervals(self, X: np.array) -> List[ConformalBounds]:
         """Generate conformal prediction intervals.
 
@@ -521,55 +582,18 @@ class QuantileConformalEstimator:
             X_processed = self.feature_scaler.transform(X_processed)
 
         intervals = []
-        n_predict = X_processed.shape[0]
 
         # For CV+, we need to construct intervals using fold estimators
         for i, (alpha, alpha_adjusted) in enumerate(
             zip(self.alphas, self.updated_alphas)
         ):
-            lower_quantile, upper_quantile = alpha_to_quantiles(alpha)
-            lower_idx = self.quantile_indices[lower_quantile]
-            upper_idx = self.quantile_indices[upper_quantile]
-
             if self.conformalize_predictions:
                 # CV+ method: for each validation point i and corresponding fold k(i),
                 # compute Q̂_{-S_{k(i)}}(x) ± R_i, then take quantiles
+                lower_values, upper_values, n_scores = (
+                    self.build_augmented_calibration_arrays(X_processed, i)
+                )
 
-                # Collect all scores for this alpha level
-                all_scores = []
-                for fold_scores in self.nonconformity_scores[i]:
-                    all_scores.extend(fold_scores)
-                all_scores = np.array(all_scores)
-                n_scores = len(all_scores)
-
-                # Pre-allocate arrays for better performance
-                lower_values = np.empty((n_scores, n_predict))
-                upper_values = np.empty((n_scores, n_predict))
-
-                score_idx = 0
-                for fold_idx, fold_scores in enumerate(self.nonconformity_scores[i]):
-                    fold_pred = self.fold_estimators[fold_idx].predict(X_processed)
-                    n_fold_scores = len(fold_scores)
-
-                    # Vectorized computation for all scores in this fold
-                    fold_lower_pred = fold_pred[:, lower_idx]  # shape: (n_predict,)
-                    fold_upper_pred = fold_pred[:, upper_idx]  # shape: (n_predict,)
-
-                    # Broadcast operations
-                    fold_scores_array = np.array(fold_scores).reshape(
-                        -1, 1
-                    )  # shape: (n_fold_scores, 1)
-
-                    lower_values[score_idx : score_idx + n_fold_scores] = (
-                        fold_lower_pred - fold_scores_array
-                    )
-                    upper_values[score_idx : score_idx + n_fold_scores] = (
-                        fold_upper_pred + fold_scores_array
-                    )
-
-                    score_idx += n_fold_scores
-
-                # Vectorized quantile computation
                 quantile_factor = alpha_adjusted / (1 + 1 / n_scores)
                 upper_quantile_factor = (1 - alpha_adjusted) / (1 + 1 / n_scores)
 
@@ -581,6 +605,9 @@ class QuantileConformalEstimator:
                 )
             else:
                 # Non-conformalized: use first fold estimator (or any single estimator)
+                lower_quantile, upper_quantile = alpha_to_quantiles(alpha)
+                lower_idx = self.quantile_indices[lower_quantile]
+                upper_idx = self.quantile_indices[upper_quantile]
                 prediction = self.fold_estimators[0].predict(X_processed)
                 lower_interval_bound = prediction[:, lower_idx]
                 upper_interval_bound = prediction[:, upper_idx]
@@ -591,23 +618,44 @@ class QuantileConformalEstimator:
                 )
             )
 
-        return intervals
+        # Apply Chernozhukov monotone rearrangement across all conformalized quantiles.
+        all_bounds = []
+        quantile_levels = []
+        for i, alpha in enumerate(self.alphas):
+            lower_q, upper_q = alpha_to_quantiles(alpha)
+            all_bounds.extend([intervals[i].lower_bounds, intervals[i].upper_bounds])
+            quantile_levels.extend([lower_q, upper_q])
+
+        final_bounds = monotone_rearrange(np.column_stack(all_bounds), quantile_levels)
+
+        return [
+            ConformalBounds(
+                lower_bounds=final_bounds[:, 2 * i],
+                upper_bounds=final_bounds[:, 2 * i + 1],
+            )
+            for i in range(len(self.alphas))
+        ]
 
     def calculate_betas(self, X: np.array, y_true: float) -> list[float]:
-        """Calculate empirical p-values (beta values) for conformity assessment.
+        """Calculate empirical coverage feedback (beta values) for adaptation.
 
-        Computes alpha-specific empirical p-values representing the fraction of
-        calibration nonconformity scores that are greater than or equal to the
-        nonconformity score of a new observation.
+        For each alpha level, computes ``beta_t := sup{beta : y_true in
+        C_t(beta)}`` against the *exact same* Ĉ_t(·) construction that
+        ``predict_intervals`` uses to serve the interval (shared via
+        ``_build_augmented_calibration_arrays``/``_invert_beta_from_augmented_arrays``).
+        For CV+ this correctly pairs each held-out calibration score with its
+        own fold estimator's prediction (rather than averaging across folds),
+        and for both CV+ and split conformal it applies the same ``n/(n+1)``-style
+        finite-sample correction factor used at prediction time. This guarantees
+        the beta fed into any adapter (e.g. DtACI) reflects the coverage of the
+        interval actually being served, not an approximation of it.
 
         Args:
             X: Input features for single prediction, shape (n_features,).
             y_true: True target value for conformity assessment.
 
         Returns:
-            List of beta values (empirical p-values), one per alpha level.
-            Each beta ∈ [0, 1] represents the empirical quantile of the
-            nonconformity score in the corresponding calibration distribution.
+            List of beta values, one per alpha level, each in [0, 1].
             Returns [0.5] * len(alphas) for non-conformalized mode.
 
         Raises:
@@ -626,31 +674,16 @@ class QuantileConformalEstimator:
             X_processed = self.feature_scaler.transform(X_processed)
 
         betas = []
-        for i, alpha in enumerate(self.alphas):
-            lower_quantile, upper_quantile = alpha_to_quantiles(alpha)
-            lower_idx = self.quantile_indices[lower_quantile]
-            upper_idx = self.quantile_indices[upper_quantile]
-
-            # Compute average prediction across all fold estimators
-            all_predictions = []
-            for fold_estimator in self.fold_estimators:
-                fold_pred = fold_estimator.predict(X_processed)
-                all_predictions.append(fold_pred)
-
-            avg_prediction = np.mean(all_predictions, axis=0)
-            lower_bound = avg_prediction[0, lower_idx]
-            upper_bound = avg_prediction[0, upper_idx]
-
-            lower_deviation = lower_bound - y_true
-            upper_deviation = y_true - upper_bound
-            nonconformity = max(lower_deviation, upper_deviation)
-
-            # Calculate beta using calibration scores from all folds for this alpha
-            all_fold_scores = []
-            for fold_scores in self.nonconformity_scores[i]:
-                all_fold_scores.extend(fold_scores)
-            beta = np.mean(np.array(all_fold_scores) >= nonconformity)
-
+        for i in range(len(self.alphas)):
+            lower_values, upper_values, n_scores = (
+                self.build_augmented_calibration_arrays(X_processed, i)
+            )
+            beta = self.invert_beta_from_augmented_arrays(
+                lower_values_col=lower_values[:, 0],
+                upper_values_col=upper_values[:, 0],
+                y_true=y_true,
+                n_scores=n_scores,
+            )
             betas.append(beta)
 
         return betas

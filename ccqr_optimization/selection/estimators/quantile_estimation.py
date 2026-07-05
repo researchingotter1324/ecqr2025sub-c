@@ -7,16 +7,21 @@ random forest, neural network, and Gaussian process variants optimized for uncer
 quantification in conformal prediction frameworks.
 """
 
-from typing import List, Union, Optional
+from typing import Dict, List, Union, Optional
 import numpy as np
+from ccqr_optimization.utils.math import monotone_rearrange
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble._forest import _generate_sample_indices, _get_n_samples_bootstrap
 from sklearn.neighbors import NearestNeighbors
 from statsmodels.regression.quantile_regression import QuantReg
 from sklearn.base import clone
 from abc import ABC, abstractmethod
 from scipy.stats import norm
 from scipy.linalg import solve_triangular, cholesky, LinAlgError
+from sklearn.preprocessing import SplineTransformer
+from sklearn.linear_model import QuantileRegressor as SKLearnQuantileRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process.kernels import (
     RBF,
     Matern,
@@ -24,7 +29,9 @@ from sklearn.gaussian_process.kernels import (
     ExpSineSquared,
     ConstantKernel as C,
     Kernel,
+    WhiteKernel,
 )
+from sklearn.utils.validation import check_array
 import warnings
 import copy
 import logging
@@ -44,6 +51,7 @@ class BaseMultiFitQuantileEstimator(ABC):
         Returns:
             Self for method chaining.
         """
+        self.quantiles = quantiles
         self.trained_estimators = []
         for quantile in quantiles:
             quantile_estimator = self._fit_quantile_estimator(X, y, quantile)
@@ -81,7 +89,7 @@ class BaseMultiFitQuantileEstimator(ABC):
         y_pred = np.column_stack(
             [estimator.predict(X) for estimator in self.trained_estimators]
         )
-        return y_pred
+        return monotone_rearrange(y_pred, self.quantiles)
 
 
 class BaseSingleFitQuantileEstimator(ABC):
@@ -429,15 +437,26 @@ class QuantileForest(BaseSingleFitQuantileEstimator):
     def _get_candidate_local_distribution(self, X: np.ndarray) -> np.ndarray:
         """Extract tree prediction distributions for quantile computation.
 
+        Uses apply() to obtain leaf assignments and then looks up each tree's
+        stored leaf mean in a single vectorised pass, avoiding the O(n_trees)
+        Python-loop overhead of calling individual estimator.predict() per tree.
+
         Args:
             X: Features with shape (n_samples, n_features).
 
         Returns:
             Tree predictions with shape (n_samples, n_estimators).
         """
-        sub_preds = np.column_stack(
-            [estimator.predict(X) for estimator in self.fitted_model.estimators_]
-        )
+        # apply() returns (n_samples, n_estimators) leaf node ids in one batched call
+        leaf_ids = self.fitted_model.apply(X)  # (n_samples, n_trees)
+        n_samples, n_trees = leaf_ids.shape
+
+        sub_preds = np.empty((n_samples, n_trees), dtype=np.float64)
+        for b, estimator in enumerate(self.fitted_model.estimators_):
+            # tree_.value has shape (n_nodes, n_outputs, max_n_classes);
+            # index with leaf ids to get the stored mean for each sample
+            sub_preds[:, b] = estimator.tree_.value[leaf_ids[:, b], 0, 0]
+
         return sub_preds
 
 
@@ -569,6 +588,8 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
 
         # Fitted attributes
         self.X_train_ = None
+        self.X_train_mean_ = None
+        self.X_train_std_ = None
         self.y_train_ = None
         self.kernel_ = None
         self.noise_variance_ = None
@@ -670,14 +691,17 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         # If noise_variance is "optimize", use a small alpha and let GP optimize noise
         # If noise_variance is fixed, use it as alpha
         if self.noise_variance == "optimize":
-            alpha_for_opt = self.alpha  # Small regularization only
+            # We use a small fixed alpha for numerical stability, WhiteKernel handles the actual noise
+            kernel_to_fit = self.kernel_ + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-5, 1e1))
+            alpha_for_opt = max(self.alpha, 1e-6)
         else:
+            kernel_to_fit = self.kernel_
             alpha_for_opt = self.noise_variance_ + self.alpha
 
         # Use sklearn's GaussianProcessRegressor for hyperparameter optimization
         # This provides robust optimization with proper parameter mapping
         temp_gp = GaussianProcessRegressor(
-            kernel=self.kernel_,
+            kernel=kernel_to_fit,
             alpha=alpha_for_opt,
             n_restarts_optimizer=self.n_restarts_optimizer,
             random_state=self.random_state,
@@ -693,15 +717,23 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
                     category=UserWarning,
                     module="sklearn.gaussian_process.kernels",
                 )
+                warnings.filterwarnings(
+                    "ignore",
+                    category=ConvergenceWarning,
+                )
                 temp_gp.fit(self.X_train_, self.y_train_)
+            
             # Extract optimized kernel
-            self.kernel_ = temp_gp.kernel_
-
-            # Extract optimized noise variance if it was being optimized
             if self.noise_variance == "optimize":
-                # sklearn's alpha includes both noise and regularization
-                # Extract the optimized noise component
-                self.noise_variance_ = max(temp_gp.alpha - self.alpha, 1e-10)
+                # temp_gp.kernel_ is a Sum(base_kernel, WhiteKernel)
+                # Extract the optimized base kernel and the optimized noise level
+                self.kernel_ = temp_gp.kernel_.k1
+                # The true optimized noise variance includes alpha_for_opt.
+                # We subtract self.alpha so that when self.alpha is added in _fit_gp,
+                # the total noise matches the optimized noise exactly.
+                self.noise_variance_ = temp_gp.kernel_.k2.noise_level + alpha_for_opt - self.alpha
+            else:
+                self.kernel_ = temp_gp.kernel_
 
         except Exception as e:
             logging.warning(
@@ -724,8 +756,12 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         Returns:
             Self for method chaining.
         """
-        # Store training data
-        self.X_train_ = X.copy()
+        # Normalize features
+        self.X_train_mean_ = np.mean(X, axis=0)
+        self.X_train_std_ = np.std(X, axis=0)
+        # Handle constant features
+        self.X_train_std_[self.X_train_std_ < 1e-12] = 1.0
+        self.X_train_ = (X - self.X_train_mean_) / self.X_train_std_
 
         # Normalize targets
         self.y_train_mean_ = np.mean(y)
@@ -738,9 +774,11 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         n_features = X.shape[1]
         self.kernel_ = self._get_kernel_object(self.kernel, n_features)
 
-        # Set noise variance
+        # Set noise variance in normalized target space.
+        # The kernel matrix is built on normalized targets (zero-mean, unit-variance),
+        # so noise variance must be converted to the same normalized scale.
         if isinstance(self.noise_variance, (int, float)):
-            self.noise_variance_ = self.noise_variance
+            self.noise_variance_ = self.noise_variance / self.y_train_std_**2
         else:
             self.noise_variance_ = 1e-6  # Default, will be optimized if needed
 
@@ -758,19 +796,24 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         K = self.kernel_(self.X_train_)
 
         # Add noise and regularization
-        K += (self.noise_variance_ + self.alpha) * np.eye(len(self.X_train_))
+        K[np.diag_indices(len(self.X_train_))] += self.noise_variance_ + self.alpha
 
         # Robust Cholesky decomposition with progressive regularization
         regularization_levels = [0, 1e-8, 1e-6, 1e-4, 1e-3]
+        
+        self.effective_noise_variance_ = self.noise_variance_ + self.alpha
 
         for reg in regularization_levels:
             try:
-                K_reg = K + reg * np.eye(len(self.X_train_)) if reg > 0 else K
+                K_reg = K.copy()
+                if reg > 0:
+                    K_reg[np.diag_indices(len(self.X_train_))] += reg
                 self.chol_factor_ = cholesky(K_reg, lower=True)
                 if reg > 0:
                     logging.warning(
                         f"Added regularization {reg} for numerical stability"
                     )
+                    self.effective_noise_variance_ += reg
                 break
             except LinAlgError:
                 if reg == regularization_levels[-1]:
@@ -782,8 +825,13 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
                     return
                 continue
 
-        # Solve for alpha using Cholesky decomposition
-        self.alpha_ = solve_triangular(self.chol_factor_, self.y_train_, lower=True)
+        # Solve for alpha = K^-1 y using Cholesky decomposition
+        # Optuna's math for alpha (cov_Y_Y_inv_Y)
+        self.alpha_ = solve_triangular(
+            self.chol_factor_.T,
+            solve_triangular(self.chol_factor_, self.y_train_, lower=True),
+            lower=False,
+        )
 
     def _fit_gp_eigendecomp(self, K: np.ndarray) -> None:
         """Fallback GP fitting using eigendecomposition for ill-conditioned matrices."""
@@ -793,13 +841,10 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         # Clip negative eigenvalues and add regularization
         eigenvals = np.maximum(eigenvals, 1e-12)
 
-        # Reconstruct with regularized eigenvalues
-        eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
-
         # Use pseudo-inverse for fitting
         try:
-            K_inv = eigenvecs @ np.diag(1.0 / eigenvals) @ eigenvecs.T
-            self.alpha_ = K_inv @ self.y_train_
+            # More stable computation of K^-1 y avoiding explicit K_inv construction
+            self.alpha_ = eigenvecs @ ((eigenvecs.T @ self.y_train_) / eigenvals)
             # Store decomposition for prediction
             self.eigenvals_ = eigenvals
             self.eigenvecs_ = eigenvecs
@@ -859,29 +904,36 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         Returns:
             Tuple of (y_mean, y_var) with shapes (n_samples,) each.
         """
+        # Normalize test features
+        X_norm = (X - self.X_train_mean_) / self.X_train_std_
+
         # Compute kernel between test and training points
-        K_star = self.kernel_(X, self.X_train_)
+        K_star = self.kernel_(X_norm, self.X_train_)
 
         if self.chol_factor_ is not None:
-            # Use Cholesky-based computation
-            chol_solve = solve_triangular(self.chol_factor_, K_star.T, lower=True)
-            y_mean = chol_solve.T @ self.alpha_
+            # Optuna's math for prediction
+            y_mean = np.dot(K_star, self.alpha_)
 
-            # Compute variance (in normalized space)
-            K_star_star = self.kernel_.diag(X)
-            y_var = K_star_star - np.sum(chol_solve**2, axis=0)
+            # V = K_star @ inv(C)
+            V = solve_triangular(
+                self.chol_factor_.T,
+                solve_triangular(self.chol_factor_, K_star.T, lower=True),
+                lower=False,
+            ).T
+            
+            K_star_star = self.kernel_.diag(X_norm)
+            y_var = K_star_star - np.sum(K_star * V, axis=1)
 
         else:
             # Use eigendecomposition fallback
             y_mean = K_star @ self.alpha_
 
             # Compute variance using eigendecomposition
-            K_star_star = self.kernel_.diag(X)
-            # K^{-1} = V * Λ^{-1} * V^T
+            K_star_star = self.kernel_.diag(X_norm)
+            # K^{-1} K_*^T = V * Λ^{-1} * V^T * K_*^T
             K_inv_K_star = (
                 self.eigenvecs_
-                @ (K_star.T / self.eigenvals_.reshape(-1, 1))
-                @ self.eigenvecs_.T
+                @ ((self.eigenvecs_.T @ K_star.T) / self.eigenvals_.reshape(-1, 1))
             )
             y_var = K_star_star - np.sum(K_star * K_inv_K_star.T, axis=1)
 
@@ -889,13 +941,14 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
         y_mean = y_mean * self.y_train_std_ + self.y_train_mean_
 
         # Ensure non-negative variance before denormalization
-        y_var = np.maximum(y_var, 1e-12)
+        y_var = np.maximum(y_var, 0.0)
 
         # Denormalize variance (transforms from normalized to original scale)
         y_var *= self.y_train_std_**2
 
         # Add noise variance in original scale for total predictive variance
-        y_var += self.noise_variance_ * self.y_train_std_**2
+        # The total noise variance assumed by the model includes alpha and any regularization
+        y_var += self.effective_noise_variance_ * self.y_train_std_**2
 
         return y_mean, y_var
 
@@ -938,28 +991,33 @@ class QuantileGP(BaseSingleFitQuantileEstimator):
 
 
 class QuantileLeaf(BaseSingleFitQuantileEstimator):
-    """Quantile Regression Forest using raw Y values from leaf nodes (Meinshausen 2006).
+    """Quantile Regression Forest via leaf-weighted empirical CDF (Meinshausen 2006).
 
-    Implements quantile regression following the approach in Meinshausen (2006) where
-    quantiles are computed from the empirical distribution of all raw Y training values
-    that fall into the same leaf nodes as the prediction point across all trees.
+    Each training sample receives a proximity weight relative to a test point x:
 
-    For a prediction point x, the method collects all training targets Y_i where
-    training point X_i and prediction point x end up in the same leaf node across
-    all trees in the forest. Quantiles are then computed as empirical percentiles
-    of this combined set of Y values.
+        w_i(x) = (1/B) * sum_b [ 1(X_i in L_b(x)) / |L_b(x)| ]
 
-    This approach differs from standard random forest quantiles by using raw training
-    targets rather than tree predictions, providing more accurate uncertainty
-    quantification especially in regions with heteroscedastic noise.
+    where L_b(x) is the leaf reached by x in tree b and |L_b(x)| is the count of
+    in-bag training samples in that leaf. Quantiles are read from the weighted
+    empirical CDF F_hat(y|x) = sum_i w_i(x) * 1(Y_i <= y) using linear
+    interpolation, matching numpy's default quantile convention.
+
+    Bootstrap membership is reconstructed via sklearn's internal
+    ``_generate_sample_indices`` with the exact RNG state each tree used during
+    ``forest.fit()``, guaranteeing identical in-bag sets.
+
+    At fit time a leaf-to-rank-index table is built once per tree, and weight
+    rows for all training samples are pre-computed and cached (keyed by their
+    leaf-ID signature). Tree leaf assignments use direct Cython ``tree_.apply``
+    calls, bypassing sklearn's per-call Python validation layer.
 
     Args:
         n_estimators: Number of trees in the forest.
         max_depth: Maximum depth of individual trees.
-        max_features: Fraction of features considered for best split.
-        min_samples_split: Minimum samples required to split internal nodes.
-        min_samples_leaf: Minimum samples required at leaf nodes.
-        bootstrap: Whether to use bootstrap sampling for tree training.
+        max_features: Fraction of features considered at each split.
+        min_samples_split: Minimum samples required to split an internal node.
+        min_samples_leaf: Minimum samples required at a leaf node.
+        bootstrap: Whether to use bootstrap sampling for each tree.
         random_state: Seed for reproducible tree construction.
     """
 
@@ -981,22 +1039,21 @@ class QuantileLeaf(BaseSingleFitQuantileEstimator):
         self.min_samples_leaf = min_samples_leaf
         self.bootstrap = bootstrap
         self.random_state = random_state
-        self.X_train = None
-        self.y_train = None
+        self.y_train_sorted: Optional[np.ndarray] = None
         self.forest = None
+        self._leaf_table: Optional[List[Dict[int, np.ndarray]]] = None
 
     def _fit_implementation(self, X: np.ndarray, y: np.ndarray):
-        """Fit the random forest and store training data for leaf node lookup.
+        """Fit the forest and build the per-tree leaf-to-rank-index table.
 
         Args:
-            X: Training features with shape (n_samples, n_features).
-            y: Training targets with shape (n_samples,).
+            X: Training features, shape (n_samples, n_features).
+            y: Training targets, shape (n_samples,).
 
         Returns:
-            Self for method chaining.
+            Self.
         """
-        self.X_train = X.copy()
-        self.y_train = y.copy()
+        n_train = len(y)
 
         self.forest = RandomForestRegressor(
             n_estimators=self.n_estimators,
@@ -1008,84 +1065,499 @@ class QuantileLeaf(BaseSingleFitQuantileEstimator):
             random_state=self.random_state,
         )
         self.forest.fit(X, y)
+
+        sorter = np.argsort(y)
+        self.y_train_sorted = y[sorter]
+        rank_of = np.argsort(sorter)
+
+        n_bootstrap = _get_n_samples_bootstrap(n_train, self.forest.max_samples)
+        train_leaf_ids = self.forest.apply(X)
+        self._tree_apply_fns = [est.tree_.apply for est in self.forest.estimators_]
+
+        self._leaf_table = []
+        for b, estimator in enumerate(self.forest.estimators_):
+            bootstrap_indices = (
+                _generate_sample_indices(estimator.random_state, n_train, n_bootstrap)
+                if self.bootstrap
+                else np.arange(n_train)
+            )
+
+            inbag_ranks = rank_of[bootstrap_indices]
+            inbag_leaf_ids = train_leaf_ids[bootstrap_indices, b]
+
+            sorted_order = np.argsort(inbag_leaf_ids)
+            unique_leaves, starts = np.unique(inbag_leaf_ids[sorted_order], return_index=True)
+            ends = np.append(starts[1:], len(sorted_order))
+
+            self._leaf_table.append({
+                int(leaf): np.sort(inbag_ranks[sorted_order[s:e]])
+                for leaf, s, e in zip(unique_leaves, starts, ends)
+            })
+
+        self._weight_cache: Dict[bytes, np.ndarray] = {}
+        train_weights = self._weights_from_leaf_ids(train_leaf_ids)
+        for i in range(n_train):
+            self._weight_cache[train_leaf_ids[i].tobytes()] = train_weights[i]
+
         return self
 
-    def _get_candidate_local_distribution(self, X: np.ndarray) -> np.ndarray:
-        """Extract raw Y values from leaf nodes for quantile computation.
+    def _weights_from_leaf_ids(self, leaf_ids: np.ndarray) -> np.ndarray:
+        """Compute a Meinshausen (2006) weight matrix from leaf-ID assignments.
 
-        For each prediction point, finds all training targets that fall into
-        the same leaf nodes across all trees. This creates the empirical
-        distribution used for quantile estimation following Meinshausen (2006).
+        For each tree b, test points sharing a leaf with in-bag training samples
+        receive weight ``1/|L_b(x)|`` from those samples. Weights are accumulated
+        in rank space (aligned to ``y_train_sorted``) across all trees, then
+        normalised to sum to 1 per row.
 
         Args:
-            X: Features with shape (n_samples, n_features).
+            leaf_ids: Integer array (n_test, n_trees) of leaf node IDs.
 
         Returns:
-            Raw Y values from matching leaf nodes with shape (n_samples, variable).
-            Each row contains the training targets from leaf nodes that contain
-            the corresponding prediction point. Rows may have different lengths,
-            so the array is padded with NaN values and the actual distribution
-            is extracted during quantile computation.
+            Weight matrix (n_test, n_train_sorted), rows sum to 1.
         """
-        # Get leaf indices for training and test data for all trees
-        train_leaf_indices = self.forest.apply(self.X_train)  # (n_train, n_trees)
-        test_leaf_indices = self.forest.apply(X)  # (n_test, n_trees)
+        n_test = len(leaf_ids)
+        n_train = len(self.y_train_sorted)
+        n_trees = len(self.forest.estimators_)
 
-        # Collect Y values for each test point
-        candidate_distributions = []
+        weights = np.zeros((n_test, n_train), dtype=np.float64)
 
-        for i in range(len(X)):
-            y_values_for_point = []
+        for b in range(n_trees):
+            tree_table = self._leaf_table[b]
+            leaves_for_tree = leaf_ids[:, b]
 
-            # For each tree, find training points in the same leaf as test point i
-            for tree_idx in range(self.n_estimators):
-                test_leaf = test_leaf_indices[i, tree_idx]
-                # Find training points that ended up in the same leaf
-                same_leaf_mask = train_leaf_indices[:, tree_idx] == test_leaf
-                # Collect corresponding Y values
-                y_values_for_point.extend(self.y_train[same_leaf_mask])
+            sorted_order = np.argsort(leaves_for_tree)
+            unique_leaves, starts = np.unique(leaves_for_tree[sorted_order], return_index=True)
+            ends = np.append(starts[1:], n_test)
 
-            candidate_distributions.append(np.array(y_values_for_point))
+            for leaf, ts, te in zip(unique_leaves, starts, ends):
+                inbag_ranks = tree_table.get(int(leaf))
+                if inbag_ranks is None or len(inbag_ranks) == 0:
+                    continue
+                test_indices = sorted_order[ts:te]
+                weights[np.ix_(test_indices, inbag_ranks)] += 1.0 / len(inbag_ranks)
 
-        # Convert to consistent array format by padding with NaN
-        max_length = max(len(dist) for dist in candidate_distributions)
-        padded_distributions = np.full((len(X), max_length), np.nan)
+        weights /= n_trees
+        row_sums = weights.sum(axis=1, keepdims=True)
+        weights /= np.where(row_sums == 0, 1.0, row_sums)
+        return weights
 
-        for i, dist in enumerate(candidate_distributions):
-            padded_distributions[i, : len(dist)] = dist
+    def _proximity_weights(self, X: np.ndarray) -> np.ndarray:
+        """Return the weight matrix for X, served from cache where possible.
 
-        return padded_distributions
+        Each test point's weight row is uniquely determined by its leaf-ID
+        signature across all trees. The cache is keyed by this signature
+        (stable across feature-scaler changes). Misses are computed via the
+        vectorised ``_weights_from_leaf_ids`` and then stored.
+
+        Args:
+            X: Test features, shape (n_test, n_features).
+
+        Returns:
+            Weight matrix (n_test, n_train_sorted), rows sum to 1.
+        """
+        from sklearn.tree._tree import DTYPE as _SKLEARN_DTYPE
+
+        n_test = len(X)
+        n_train = len(self.y_train_sorted)
+        n_trees = len(self.forest.estimators_)
+
+        X_f32 = np.asarray(X, dtype=_SKLEARN_DTYPE, order="C")
+        leaf_ids = np.column_stack(
+            [self._tree_apply_fns[b](X_f32) for b in range(n_trees)]
+        )
+
+        weights = np.empty((n_test, n_train), dtype=np.float64)
+        cache = self._weight_cache
+        miss_indices = []
+
+        for i in range(n_test):
+            cached = cache.get(leaf_ids[i].tobytes())
+            if cached is not None:
+                weights[i] = cached
+            else:
+                miss_indices.append(i)
+
+        if miss_indices:
+            miss_arr = np.array(miss_indices)
+            miss_weights = self._weights_from_leaf_ids(leaf_ids[miss_arr])
+            for local_i, global_i in enumerate(miss_indices):
+                w = miss_weights[local_i]
+                weights[global_i] = w
+                cache[leaf_ids[global_i].tobytes()] = w
+
+        return weights
+
+    def _get_candidate_local_distribution(self, X: np.ndarray) -> np.ndarray:
+        raise NotImplementedError(
+            "QuantileLeaf predicts via a weighted empirical CDF; call predict() directly."
+        )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Generate quantile predictions from raw Y values in matching leaf nodes.
+        """Return quantile predictions for X via the weighted empirical CDF.
 
-        Overrides the base class method to handle variable-length distributions
-        from leaf nodes. Computes empirical quantiles while ignoring NaN padding.
+        Steps:
+        1. Compute proximity weights w_i(x) for each test point.
+        2. Form the weighted empirical CDF over sorted training targets.
+        3. Invert the CDF at each requested quantile with linear interpolation
+           (matching numpy's default 'linear' method).
 
         Args:
-            X: Features for prediction with shape (n_samples, n_features).
+            X: Features, shape (n_samples, n_features).
 
         Returns:
-            Quantile predictions with shape (n_samples, n_quantiles).
+            Quantile predictions, shape (n_samples, n_quantiles).
         """
-        candidate_distributions = self._get_candidate_local_distribution(X)
+        weights = self._proximity_weights(X)
+        cdf = np.cumsum(weights, axis=1)
 
-        # Compute quantiles for each test point, ignoring NaN values
-        quantile_preds = np.zeros((len(X), len(self.quantiles)))
+        quantiles_arr = np.asarray(self.quantiles)
+        n_test, n_train = weights.shape
 
-        for i in range(len(X)):
-            # Extract non-NaN values for this point
-            valid_values = candidate_distributions[i][
-                ~np.isnan(candidate_distributions[i])
-            ]
+        r_hi = np.apply_along_axis(
+            lambda row: np.searchsorted(row, quantiles_arr, side="left"),
+            axis=1,
+            arr=cdf,
+        )
+        r_hi = np.clip(r_hi, 0, n_train - 1)
+        r_lo = np.clip(r_hi - 1, 0, n_train - 1)
 
-            if len(valid_values) > 0:
-                # Compute empirical quantiles
-                quantile_preds[i] = np.quantile(valid_values, self.quantiles)
+        y_hi = self.y_train_sorted[r_hi]
+        y_lo = self.y_train_sorted[r_lo]
+        cdf_hi = cdf[np.arange(n_test)[:, None], r_hi]
+        cdf_lo = cdf[np.arange(n_test)[:, None], r_lo]
+
+        denom = cdf_hi - cdf_lo
+        safe_denom = np.where(denom > 0, denom, 1.0)
+        fraction = np.where(denom > 0, (quantiles_arr[None, :] - cdf_lo) / safe_denom, 0.0)
+
+        return y_lo + fraction * (y_hi - y_lo)
+
+
+class SplineQuantRegWrapper:
+    """Fitted single-quantile spline-GAM model.
+
+    Stores the intercept separately from spline/binary coefficients so the
+    intercept is never subject to L1 regularization.
+
+    Args:
+        coef_: Coefficient vector for spline + binary features, shape (n_design,).
+        intercept_: Scalar intercept (0.0 when ``add_intercept=False``).
+        spline_transformer: Fitted ``SplineTransformer`` applied to continuous columns.
+        continuous_cols: Integer indices of continuous feature columns.
+        binary_cols: Integer indices of binary (passthrough) feature columns.
+        add_intercept: Whether an intercept was fitted.
+    """
+
+    def __init__(
+        self,
+        coef_: np.ndarray,
+        intercept_: float,
+        spline_transformer: SplineTransformer,
+        continuous_cols: np.ndarray,
+        binary_cols: np.ndarray,
+        add_intercept: bool,
+    ):
+        self.coef_ = np.asarray(coef_, dtype=np.float64)
+        self.intercept_ = float(intercept_)
+        self.spline_transformer = spline_transformer
+        self.continuous_cols = continuous_cols
+        self.binary_cols = binary_cols
+        self.add_intercept = add_intercept
+        self.n_features_in_: int = len(continuous_cols) + len(binary_cols)
+        self.design_n_features_: int = len(self.coef_)
+
+        _p = (
+            np.concatenate([[self.intercept_], self.coef_])
+            if add_intercept
+            else self.coef_
+        )
+
+        class _Result:
+            def __init__(self, params: np.ndarray):
+                self.params = params
+
+        self.result = _Result(_p)
+
+    def _transform_X(self, X: np.ndarray) -> np.ndarray:
+        """Build the feature matrix from raw inputs.
+
+        Args:
+            X: Raw features, shape (n_samples, n_features).
+
+        Returns:
+            Feature matrix, shape (n_samples, design_n_features_).
+        """
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        parts = []
+        if len(self.continuous_cols) > 0:
+            parts.append(self.spline_transformer.transform(X[:, self.continuous_cols]))
+        if len(self.binary_cols) > 0:
+            parts.append(X[:, self.binary_cols].astype(np.float64))
+        if not parts:
+            return np.zeros((len(X), 0), dtype=np.float64)
+        return np.concatenate(parts, axis=1)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return quantile predictions.
+
+        Args:
+            X: Features, shape (n_samples, n_features).
+
+        Returns:
+            Predictions, shape (n_samples,).
+        """
+        return self._transform_X(X) @ self.coef_ + self.intercept_
+
+
+class SplineQuantileRegressor(BaseMultiFitQuantileEstimator):
+    """Per-quantile spline GAM using B-spline expansion of continuous features.
+
+    Fits one independent quantile regression model per requested quantile level.
+    Continuous input features are expanded into B-spline basis functions using
+    :class:`~sklearn.preprocessing.SplineTransformer`; binary (0/1) columns
+    pass through unchanged. Binary columns are detected automatically.
+
+    The intercept is always fitted without L1 regularization, preventing
+    predictions from collapsing toward the training mean when ``alpha > 0``.
+
+    Args:
+        n_knots: Number of knots per continuous feature.
+        degree: Polynomial degree of the B-splines (default 3 = cubic).
+        knots: Knot placement strategy passed to ``SplineTransformer``.
+            ``"quantile"`` places knots at equal quantiles of the training
+            distribution; ``"uniform"`` spaces them evenly over the range.
+        extrapolation: Extrapolation strategy passed to ``SplineTransformer``
+            (``"linear"``, ``"constant"``, ``"continue"``, or ``"periodic"``).
+        include_bias: Whether to include a bias column in the spline basis.
+        binary_threshold: Tolerance for binary-column detection.
+        add_intercept: Whether to fit an unregularized intercept term.
+        alpha: L1 regularization strength on spline/binary coefficients.
+            The intercept is always exempt from regularization.
+        solver: Backend solver. ``"highs"`` uses HiGHS interior-point LP via
+            ``sklearn.linear_model.QuantileRegressor``; ``"statsmodels"`` uses
+            IRLS with a coordinate-descent fallback.
+        max_iter: Maximum solver iterations.
+        p_tol: Convergence tolerance (statsmodels IRLS only).
+        monotone_rearrange: Apply monotone rearrangement to prevent quantile
+            crossing (inherited from :class:`BaseMultiFitQuantileEstimator`).
+        random_state: Random seed (reserved for reproducibility).
+
+    Attributes:
+        binary_cols_: Integer array of detected binary column indices.
+        continuous_cols_: Integer array of detected continuous column indices.
+        trained_estimators: List of :class:`SplineQuantRegWrapper`, one per quantile.
+        quantiles: Quantile levels passed to ``fit``.
+    """
+
+    def __init__(
+        self,
+        n_knots: int = 6,
+        degree: int = 3,
+        knots: str = "quantile",
+        extrapolation: str = "linear",
+        include_bias: bool = False,
+        binary_threshold: float = 1e-12,
+        add_intercept: bool = True,
+        alpha: float = 0.001,
+        solver: str = "highs",
+        max_iter: int = 1000,
+        p_tol: float = 1e-6,
+        monotone_rearrange: bool = True,
+        random_state: Optional[int] = None,
+    ):
+        super().__init__()
+        self.n_knots = n_knots
+        self.degree = degree
+        self.knots = knots
+        self.extrapolation = extrapolation
+        self.include_bias = include_bias
+        self.binary_threshold = binary_threshold
+        self.add_intercept = add_intercept
+        self.alpha = alpha
+        self.solver = solver
+        self.max_iter = max_iter
+        self.p_tol = p_tol
+        self.monotone_rearrange = monotone_rearrange
+        self.random_state = random_state
+
+        self.binary_cols_: Optional[np.ndarray] = None
+        self.continuous_cols_: Optional[np.ndarray] = None
+        self.trained_estimators: list = []
+
+    def fit(self, X: np.ndarray, y: np.ndarray, quantiles: List[float]):
+        """Detect feature types then fit one model per quantile.
+
+        Args:
+            X: Training features, shape (n_samples, n_features).
+            y: Training targets, shape (n_samples,).
+            quantiles: Quantile levels strictly inside (0, 1).
+
+        Returns:
+            Self.
+
+        Raises:
+            ValueError: On invalid inputs.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        X = check_array(X, dtype=np.float64, ensure_2d=True)
+        y = np.asarray(y, dtype=np.float64).ravel()
+
+        if X.shape[0] != len(y):
+            raise ValueError(f"X has {X.shape[0]} rows but y has {len(y)} elements.")
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            raise ValueError("X contains NaN or Inf values.")
+        if np.any(np.isnan(y)) or np.any(np.isinf(y)):
+            raise ValueError("y contains NaN or Inf values.")
+
+        quantiles_arr = np.asarray(quantiles, dtype=np.float64)
+        if np.any(quantiles_arr <= 0.0) or np.any(quantiles_arr >= 1.0):
+            raise ValueError("All quantiles must be strictly inside (0, 1).")
+
+        n_features = X.shape[1]
+        binary_mask = np.zeros(n_features, dtype=bool)
+        for j in range(n_features):
+            col = X[:, j]
+            finite_vals = col[np.isfinite(col)]
+            unique_vals = np.unique(finite_vals)
+            binary_mask[j] = np.all(
+                np.isclose(unique_vals, 0, atol=self.binary_threshold)
+                | np.isclose(unique_vals, 1, atol=self.binary_threshold)
+            )
+
+        self.binary_cols_ = np.where(binary_mask)[0]
+        self.continuous_cols_ = np.where(~binary_mask)[0]
+
+        if len(self.continuous_cols_) == 0 and len(self.binary_cols_) == 0:
+            raise ValueError("X has no usable columns.")
+
+        return super().fit(X, y, list(quantiles_arr))
+
+    def _fit_quantile_estimator(
+        self, X: np.ndarray, y: np.ndarray, quantile: float
+    ) -> SplineQuantRegWrapper:
+        """Fit a single spline-GAM quantile model.
+
+        Args:
+            X: Training features, shape (n_samples, n_features).
+            y: Training targets, shape (n_samples,).
+            quantile: Quantile level in (0, 1).
+
+        Returns:
+            Fitted :class:`SplineQuantRegWrapper`.
+        """
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+
+        spline_transformer = SplineTransformer(
+            n_knots=self.n_knots,
+            degree=self.degree,
+            knots=self.knots,
+            include_bias=self.include_bias,
+            extrapolation=self.extrapolation,
+        )
+
+        feat_parts: list = []
+        if len(self.continuous_cols_) > 0:
+            feat_parts.append(spline_transformer.fit_transform(X[:, self.continuous_cols_]))
+        else:
+            spline_transformer.fit(np.zeros((len(y), 1)))
+
+        if len(self.binary_cols_) > 0:
+            feat_parts.append(X[:, self.binary_cols_].astype(np.float64))
+
+        X_features = (
+            np.concatenate(feat_parts, axis=1)
+            if feat_parts
+            else np.zeros((len(y), 0), dtype=np.float64)
+        )
+
+        if self.solver == "highs":
+            qr = SKLearnQuantileRegressor(
+                quantile=quantile,
+                alpha=self.alpha,
+                solver="highs-ipm",
+                solver_options={"maxiter": self.max_iter},
+                fit_intercept=self.add_intercept,
+            )
+            qr.fit(X_features, y)
+            coef_ = qr.coef_
+            intercept_ = float(qr.intercept_) if self.add_intercept else 0.0
+
+        elif self.solver == "statsmodels":
+            if self.add_intercept:
+                X_design = np.column_stack([np.ones(len(y)), X_features])
             else:
-                # Fallback to forest mean prediction if no valid values
-                # This should rarely happen with proper forest configuration
-                mean_pred = self.forest.predict(X[i : i + 1])[0]
-                quantile_preds[i] = mean_pred
+                X_design = X_features
+            try:
+                params = QuantReg(y, X_design).fit(
+                    q=quantile, max_iter=self.max_iter, p_tol=self.p_tol
+                ).params
+            except np.linalg.LinAlgError:
+                warnings.warn(
+                    f"QuantReg SVD failed for quantile {quantile}. "
+                    "Falling back to coordinate-descent solver."
+                )
+                params = self._coordinate_descent_qr(X_design, y, quantile)
 
-        return quantile_preds
+            if self.add_intercept:
+                intercept_ = float(params[0])
+                coef_ = params[1:]
+            else:
+                intercept_ = 0.0
+                coef_ = params
+        else:
+            raise ValueError(f"Unknown solver '{self.solver}'. Use 'highs' or 'statsmodels'.")
+
+        return SplineQuantRegWrapper(
+            coef_=coef_,
+            intercept_=intercept_,
+            spline_transformer=spline_transformer,
+            continuous_cols=self.continuous_cols_,
+            binary_cols=self.binary_cols_,
+            add_intercept=self.add_intercept,
+        )
+
+    def _coordinate_descent_qr(
+        self, X: np.ndarray, y: np.ndarray, quantile: float
+    ) -> np.ndarray:
+        """Coordinate-descent quantile regression (statsmodels fallback).
+
+        Args:
+            X: Design matrix, shape (n_samples, n_design_features).
+            y: Target values, shape (n_samples,).
+            quantile: Quantile level in (0, 1).
+
+        Returns:
+            Coefficient vector, shape (n_design_features,).
+        """
+        n_samples, n_features = X.shape
+        lambda_reg = 1e-6
+
+        try:
+            beta = np.linalg.solve(X.T @ X + lambda_reg * np.eye(n_features), X.T @ y)
+        except np.linalg.LinAlgError:
+            beta = np.zeros(n_features)
+
+        X_norms_sq = np.sum(X ** 2, axis=0) + lambda_reg
+
+        for _ in range(self.max_iter):
+            beta_old = beta.copy()
+            for j in range(n_features):
+                residual = y - X @ beta + X[:, j] * beta[j]
+                r_pos = residual >= 0
+                gradient = (
+                    -quantile * np.sum(X[r_pos, j])
+                    - (quantile - 1) * np.sum(X[~r_pos, j])
+                    + lambda_reg * beta[j]
+                )
+                beta[j] -= gradient / X_norms_sq[j]
+                if abs(beta[j]) < 1e-8:
+                    beta[j] = 0.0
+            if np.linalg.norm(beta - beta_old) < self.p_tol:
+                break
+
+        return beta

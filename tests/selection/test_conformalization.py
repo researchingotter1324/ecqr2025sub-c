@@ -60,9 +60,7 @@ def test_alpha_to_quantiles(alpha):
 )
 @pytest.mark.parametrize("tuning_iterations", [0])
 @pytest.mark.parametrize("alphas", [[0.1], [0.1, 0.3, 0.9]])
-@pytest.mark.parametrize(
-    "calibration_split_strategy", ["train_test_split", "cv", "adaptive"]
-)
+@pytest.mark.parametrize("calibration_split_strategy", ["train_test_split", "cv"])
 def test_quantile_fit_and_predict_intervals_shape_and_coverage(
     request,
     data_fixture_name,

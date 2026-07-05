@@ -22,10 +22,9 @@ def test_reproducibility(dummy_parameter_grid, method):
     )
     assert configs1 == configs2
 
-
 @pytest.mark.parametrize("method", ["uniform", "sobol"])
 def test_config_value_ranges(dummy_parameter_grid, method):
-    n = 50
+    n = 64  # Use power of 2 to avoid sobol truncation warning
     configs = get_tuning_configurations(
         parameter_grid=dummy_parameter_grid,
         n_configurations=n,

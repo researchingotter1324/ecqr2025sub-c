@@ -2,6 +2,7 @@ import logging
 from typing import List, Optional, Tuple, Literal, Union
 import numpy as np
 from copy import deepcopy
+from ccqr_optimization.utils.math import monotone_rearrange
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import KFold
 from ccqr_optimization.selection.estimators.quantile_estimation import (
@@ -30,6 +31,8 @@ class QuantileLassoMeta:
         max_iter: Maximum iterations.
         tol: Convergence tolerance.
         positive: Constrain weights to non-negative.
+        constrain_weights: If True, enforce non-negativity and sum-to-1 constraints.
+            If False, weights are unconstrained.
     """
 
     def __init__(
@@ -39,12 +42,14 @@ class QuantileLassoMeta:
         max_iter: int = 1000,
         tol: float = 1e-6,
         positive: bool = True,
+        constrain_weights: bool = True,
     ):
         self.alpha = alpha
         self.quantile = quantile
         self.max_iter = max_iter
         self.tol = tol
         self.positive = positive
+        self.constrain_weights = constrain_weights
         self.coef_ = None
 
     def _quantile_loss_objective(
@@ -74,15 +79,15 @@ class QuantileLassoMeta:
         # Initialize with uniform weights
         initial_weights = np.ones(n_features) / n_features
 
-        # Set up constraints
-        bounds = [
-            (0, None) if self.positive else (None, None) for _ in range(n_features)
-        ]
+        bounds = (
+            [(0, None) if self.constrain_weights else (None, None) for _ in range(n_features)]
+        )
+        constraints = (
+            [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+            if self.constrain_weights
+            else []
+        )
 
-        # Equality constraint: weights sum to 1
-        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-
-        # Optimize
         result = minimize(
             fun=self._quantile_loss_objective,
             x0=initial_weights,
@@ -99,14 +104,12 @@ class QuantileLassoMeta:
             logger.warning("Quantile Lasso optimization failed, using uniform weights")
             self.coef_ = np.ones(n_features) / n_features
 
-        # Ensure weights are normalized and non-negative if required
-        if self.positive:
+        if self.constrain_weights:
             self.coef_ = np.maximum(self.coef_, 0)
-
-        if np.sum(self.coef_) > 0:
-            self.coef_ = self.coef_ / np.sum(self.coef_)
-        else:
-            self.coef_ = np.ones(n_features) / n_features
+            if np.sum(self.coef_) > 0:
+                self.coef_ = self.coef_ / np.sum(self.coef_)
+            else:
+                self.coef_ = np.ones(n_features) / n_features
 
         return self
 
@@ -148,6 +151,9 @@ class QuantileEnsembleEstimator(BaseEnsembleEstimator):
         weighting_strategy: "uniform" or "linear_stack". Defaults to "uniform".
         random_state: Random seed.
         alpha: L1 regularization strength. Defaults to 0.0.
+        constrain_weights: If True, weights are constrained to be non-negative and sum
+            to 1. If False, the quantile Lasso meta-learner picks unconstrained weights.
+            Defaults to True.
 
     Raises:
         ValueError: If fewer than 2 estimators provided.
@@ -162,6 +168,7 @@ class QuantileEnsembleEstimator(BaseEnsembleEstimator):
         weighting_strategy: Literal["uniform", "linear_stack"] = "uniform",
         random_state: Optional[int] = None,
         alpha: float = 0.0,
+        constrain_weights: bool = True,
     ):
         if len(estimators) < 2:
             raise ValueError("At least 2 estimators required for ensemble")
@@ -171,6 +178,7 @@ class QuantileEnsembleEstimator(BaseEnsembleEstimator):
         self.weighting_strategy = weighting_strategy
         self.random_state = random_state
         self.alpha = alpha
+        self.constrain_weights = constrain_weights
 
         self.quantiles = None
         self.quantile_weights = None
@@ -273,18 +281,21 @@ class QuantileEnsembleEstimator(BaseEnsembleEstimator):
             quantile_pred_matrix = np.column_stack(quantile_predictions)
 
             quantile_stacker = QuantileLassoMeta(
-                alpha=self.alpha, quantile=quantiles[q_idx], positive=True
+                alpha=self.alpha,
+                quantile=quantiles[q_idx],
+                constrain_weights=self.constrain_weights,
             )
             quantile_stacker.fit(quantile_pred_matrix, val_targets_sorted)
             quantile_weights = quantile_stacker.coef_
 
-            if np.sum(quantile_weights) == 0:
-                logger.warning(
-                    f"All QuantileLasso weights are zero for quantile {q_idx}, falling back to uniform weighting"
-                )
-                quantile_weights = np.ones(len(self.estimators))
+            if self.constrain_weights:
+                if np.sum(quantile_weights) == 0:
+                    logger.warning(
+                        f"All QuantileLasso weights are zero for quantile {q_idx}, falling back to uniform weighting"
+                    )
+                    quantile_weights = np.ones(len(self.estimators))
+                quantile_weights = quantile_weights / np.sum(quantile_weights)
 
-            quantile_weights = quantile_weights / np.sum(quantile_weights)
             weights_per_quantile.append(quantile_weights)
 
         return np.array(weights_per_quantile)
@@ -386,7 +397,7 @@ class QuantileEnsembleEstimator(BaseEnsembleEstimator):
             ]  # Shape: (n_estimators, n_samples)
             ensemble_predictions[:, q_idx] = np.dot(quantile_weights, quantile_preds)
 
-        return ensemble_predictions
+        return monotone_rearrange(ensemble_predictions, self.quantiles)
 
 
 class PointEnsembleEstimator(BaseEnsembleEstimator):

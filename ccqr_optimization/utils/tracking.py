@@ -137,6 +137,9 @@ class Trial(BaseModel):
     upper_bound: Optional[float] = None
     searcher_runtime: Optional[float] = None
     target_model_runtime: Optional[float] = None
+    extreme_quantile_used: Optional[int] = None
+    ei_collapsed: Optional[int] = None
+    perc_zero_ei: Optional[float] = None
 
 
 class Study:
@@ -316,8 +319,10 @@ class StaticConfigurationManager(BaseConfigurationManager):
         self,
         search_space: dict[str, ParameterRange],
         n_candidate_configurations: int,
+        random_state: Optional[int] = None,
     ) -> None:
         super().__init__(search_space, n_candidate_configurations)
+        self.random_state = random_state
 
         # Core optimization: set-based tracking for O(1) operations
         self.searched_indices = set()
@@ -341,8 +346,7 @@ class StaticConfigurationManager(BaseConfigurationManager):
         self.all_candidate_configs = get_tuning_configurations(
             parameter_grid=self.search_space,
             n_configurations=self.n_candidate_configurations,
-            random_state=None,
-            sampling_method="uniform",
+            random_state=self.random_state,
         )
 
         # Setup encoder
@@ -440,8 +444,11 @@ class DynamicConfigurationManager(BaseConfigurationManager):
         self,
         search_space: dict[str, ParameterRange],
         n_candidate_configurations: int,
+        random_state: Optional[int] = None,
     ) -> None:
         super().__init__(search_space, n_candidate_configurations)
+        self.random_state = random_state
+        self.call_count = 0
         self.current_searchable_configs = []
         self._setup_encoder()
 
@@ -453,12 +460,16 @@ class DynamicConfigurationManager(BaseConfigurationManager):
         Returns:
             List of configuration dictionaries.
         """
+        call_seed = (
+            self.random_state + self.call_count if self.random_state is not None else None
+        )
+        self.call_count += 1
+
         candidate_configurations = get_tuning_configurations(
             parameter_grid=self.search_space,
             n_configurations=self.n_candidate_configurations
             + len(self.searched_configs),
-            random_state=None,
-            sampling_method="uniform",
+            random_state=call_seed,
         )
 
         banned_hashes = set(create_config_hash(c) for c in self.banned_configurations)

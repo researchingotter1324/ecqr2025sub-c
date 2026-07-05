@@ -1,12 +1,3 @@
-"""Hyperparameter tuning framework for quantile and point estimation models.
-
-This module provides automated hyperparameter optimization infrastructure for both
-quantile regression and standard point estimation models. It implements random search
-with cross-validation, supporting various split strategies and evaluation metrics.
-The framework integrates with the estimator registry system for unified model
-configuration and supports warm-start optimization with forced parameter configurations.
-"""
-
 import logging
 from typing import Dict, Optional, List, Union, Tuple, Any, Literal
 from copy import deepcopy
@@ -199,7 +190,6 @@ class RandomTuner:
                 parameter_grid=estimator_config.estimator_parameter_space,
                 n_configurations=n_random_configs,
                 random_state=self.random_state,
-                sampling_method="uniform",
             )
             # Combine warm start and random configurations
             tuning_configurations = forced_param_configurations + random_configs
@@ -450,3 +440,35 @@ class QuantileTuner(RandomTuner):
             quantile_score = mean_pinball_loss(Y_val, y_pred, alpha=quantile)
             scores_list.append(quantile_score)
         return sum(scores_list) / len(scores_list)
+
+
+class PointEstimator:
+    """Point estimator with implicit feature scaling.
+
+    Wraps a fitted sklearn-compatible estimator together with its fitted
+    ``StandardScaler`` so that callers pass raw (unscaled) features and receive
+    point predictions directly — the same interface ``QuantileConformalEstimator``
+    exposes for interval predictions.  Constructed and stored by
+    ``QuantileConformalSearcher.fit``; passed down to samplers that require
+    point estimates (``LowerBoundSampler``, ``ThompsonSampler`` with optimistic
+    sampling).
+
+    Attributes:
+        estimator: Fitted point-prediction model.
+        scaler: Fitted ``StandardScaler`` applied before prediction.
+    """
+
+    def __init__(self, estimator, scaler) -> None:
+        self.estimator = estimator
+        self.scaler = scaler
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return point predictions for raw (unscaled) ``X``.
+
+        Args:
+            X: Feature matrix, shape ``(n_samples, n_features)``.
+
+        Returns:
+            Point predictions, shape ``(n_samples,)``.
+        """
+        return self.estimator.predict(self.scaler.transform(X))

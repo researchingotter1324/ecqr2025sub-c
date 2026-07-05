@@ -12,6 +12,7 @@ from ccqr_optimization.selection.estimators.quantile_estimation import (
     QuantileGP,
     QuantileLeaf,
     QuantRegWrapper,
+    SplineQuantileRegressor,
 )
 
 
@@ -113,6 +114,11 @@ QUALITY_THRESHOLDS = {
         (
             QuantileLasso,
             {"max_iter": 1000, "p_tol": 1e-6, "random_state": 42},
+            "multi_fit",
+        ),
+        (
+            SplineQuantileRegressor,
+            {"n_knots": 6, "degree": 3, "alpha": 0.001, "random_state": 42},
             "multi_fit",
         ),
     ],
