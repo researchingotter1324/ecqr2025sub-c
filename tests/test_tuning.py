@@ -180,6 +180,7 @@ def test_tune_method_reproducibility(dummy_parameter_grid, random_state):
                     max_steps=None,
                     num_continuous_neighbors=8,
                     stdev=0.2,
+                    random_state=random_state,
                 ),
             ),
             n_pre_conformal_trials=15,

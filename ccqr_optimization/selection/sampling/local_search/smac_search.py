@@ -161,7 +161,11 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         vectorization_min_obtain: Minimum neighbours requested at the start of each
             walk and after a successful improvement.
         vectorization_max_obtain: Maximum neighbours obtainable per round (doubling cap).
-        random_seed: Seed for reproducibility.
+        random_state: Seed passed at construction (plain ``int``/``None``, matching
+            this codebase's usual convention). ``rng`` is the actual
+            ``np.random.Generator`` derived from it once; that instance persists
+            and evolves across every ``optimize()`` call for the life of this
+            object rather than being re-derived (and thus reset) each time.
     """
 
     def __init__(
@@ -174,7 +178,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         stdev: float = 0.2,
         vectorization_min_obtain: int = 2,
         vectorization_max_obtain: int = 64,
-        random_seed: Optional[int] = None,
+        random_state: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -186,7 +190,10 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             stdev: Gaussian noise magnitude relative to the parameter's natural scale.
             vectorization_min_obtain: Batch size at trajectory start and after improvement.
             vectorization_max_obtain: Maximum batch size (doubles on each non-improving round).
-            random_seed: RNG seed for reproducibility.
+            random_state: Seed for this instance's own RNG, consumed once at
+                construction to build ``self.rng``. A single run-level starting
+                point: it is not reapplied on later calls, so randomness still
+                evolves across trials/restarts instead of repeating.
         """
         self.n_acq_starts = n_acq_starts
         self.n_historical_starts = n_historical_starts
@@ -196,7 +203,8 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         self.stdev = stdev
         self.vectorization_min_obtain = vectorization_min_obtain
         self.vectorization_max_obtain = vectorization_max_obtain
-        self.random_seed = random_seed
+        self.random_state = random_state
+        self.rng = np.random.default_rng(random_state)
 
     def optimize(
         self,
@@ -227,7 +235,6 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         if not candidates:
             raise ValueError("candidates must not be empty.")
 
-        rng = np.random.default_rng(self.random_seed)
         scales = natural_scales(search_space)
 
         def predict(cfgs: List[Config]) -> np.ndarray:
@@ -243,7 +250,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         )
 
         start_points = self.select_starts(
-            candidates, acq_candidates, config_manager, metric_sign, rng
+            candidates, acq_candidates, config_manager, metric_sign, self.rng
         )
         if not start_points:
             logger.warning("SMAC LS: No start points; returning best random candidate.")
@@ -264,7 +271,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
                 start=start,
                 search_space=search_space,
                 scales=scales,
-                rng=rng,
+                rng=self.rng,
                 remaining_steps=remaining,
             )
             global_steps += steps_taken

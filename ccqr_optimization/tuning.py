@@ -652,7 +652,10 @@ class ConformalTuner:
         most 2048 the full pool is used and no local search budget is imposed.
 
         Local search is configured on the sampler via the ``local_search``
-        parameter. Pass a ``SmacLocalSearch`` instance::
+        parameter. Pass a ``SmacLocalSearch`` instance. Local search algorithms
+        seed their own RNG from an optional ``random_state`` given at
+        construction (independent of this method's ``random_state``); pass it
+        explicitly for reproducible local search::
 
             from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
             from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
@@ -660,7 +663,7 @@ class ConformalTuner:
 
             searcher = QuantileConformalSearcher(
                 quantile_estimator_architecture="qrf",
-                sampler=LowerBoundSampler(local_search=SmacLocalSearch()),
+                sampler=LowerBoundSampler(local_search=SmacLocalSearch(random_state=42)),
             )
             tuner.tune(searcher=searcher)
 

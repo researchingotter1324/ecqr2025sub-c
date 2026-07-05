@@ -16,6 +16,15 @@ class BaseLocalSearchAlgorithm(ABC):
     All prediction is performed through an opaque ``predict_fn`` callable rather
     than a live searcher reference, so local search algorithms have no dependency
     on the acquisition or sampler layers above them.
+
+    Subclasses accept an optional ``random_state`` seed (plain ``int``/``None``,
+    matching this codebase's usual convention) at construction, and use it to
+    build their own ``self.rng`` (an ``np.random.Generator``) once, rather than
+    drawing from unseeded OS entropy or ambient global ``numpy.random`` state.
+    That ``rng`` instance persists and keeps evolving across every subsequent
+    ``optimize()`` call for the life of the instance: ``random_state`` is a
+    single run-level starting point, not something re-applied (and thus not
+    something that resets the draw sequence) on every trial or search restart.
     """
 
     @abstractmethod

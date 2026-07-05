@@ -9,7 +9,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from numpy import exp, ceil, zeros, mod
-from numpy.random import randint, rand, randn, geometric
 
 from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
@@ -71,9 +70,9 @@ class MIES:
     Faithfully adapted from MIP-EGO implementation for ccqr_optimization.
     """
     def __init__(self, search_space: Dict[str, ParameterRange], obj_func: Callable, 
-                 x0_pop: np.ndarray, ftarget=None, max_eval=np.inf, minimize=True, 
-                 elitism=False, mu_=4, lambda_=10, sigma0=None, eta0=None, P0=None, 
-                 verbose=False):
+                 x0_pop: np.ndarray, rng: np.random.Generator, ftarget=None, max_eval=np.inf,
+                 minimize=True, elitism=False, mu_=4, lambda_=10, sigma0=None, eta0=None,
+                 P0=None, verbose=False):
 
         self.mu_ = mu_
         self.lambda_ = lambda_
@@ -86,6 +85,7 @@ class MIES:
         self.max_eval = max_eval
         self.ftarget = ftarget
         self.elitism = elitism
+        self.rng = rng
         
         self.var_names = list(search_space.keys())
         
@@ -216,7 +216,7 @@ class MIES:
             p1[self._id_hyperpar] = (np.array(p1[self._id_hyperpar]) + \
                 np.array(p2[self._id_hyperpar])) / 2
 
-            _, = np.nonzero(randn(self.dim) > 0.5)
+            _, = np.nonzero(self.rng.standard_normal(self.dim) > 0.5)
             p1[_] = p2[_]
         return p1
 
@@ -260,11 +260,14 @@ class MIES:
     def _mutate_r(self, individual):
         sigma = np.asarray(individual[self._id_sigma], dtype='float')
         if len(self._id_sigma) == 1:
-            sigma = sigma * exp(self.tau_r * randn())
+            sigma = sigma * exp(self.tau_r * self.rng.standard_normal())
         else:
-            sigma = sigma * exp(self.tau_r * randn() + self.tau_p_r * randn(self.N_r))
-        
-        R = randn(self.N_r)
+            sigma = sigma * exp(
+                self.tau_r * self.rng.standard_normal()
+                + self.tau_p_r * self.rng.standard_normal(self.N_r)
+            )
+
+        R = self.rng.standard_normal(self.N_r)
         x = np.asarray(individual[self.id_r], dtype='float')
         x_ = x + sigma * R
         
@@ -280,13 +283,16 @@ class MIES:
         eta = np.asarray(individual[self._id_eta].tolist(), dtype='float')
         x = np.asarray(individual[self.id_i], dtype='int')
         if len(self._id_eta) == 1:
-            eta = eta * exp(self.tau_i * randn())
+            eta = eta * exp(self.tau_i * self.rng.standard_normal())
         else:
-            eta = eta * exp(self.tau_i * randn() + self.tau_p_i * randn(self.N_i))
+            eta = eta * exp(
+                self.tau_i * self.rng.standard_normal()
+                + self.tau_p_i * self.rng.standard_normal(self.N_i)
+            )
         eta[eta > 1] = 1
 
         p = 1 - (eta / self.N_i) / (1 + np.sqrt(1 + (eta / self.N_i) ** 2.))
-        x_ = x + geometric(p) - geometric(p)
+        x_ = x + self.rng.geometric(p) - self.rng.geometric(p)
 
         x_ = np.asarray(handle_box_constraint(x_, self.bounds_i[:, 0], self.bounds_i[:, 1]), dtype='int')
 
@@ -295,13 +301,13 @@ class MIES:
 
     def _mutate_d(self, individual):
         P = np.asarray(individual[self._id_p], dtype='float')
-        P = 1. / (1. + (1. - P) / P * exp(-self.tau_d * randn()))
+        P = 1. / (1. + (1. - P) / P * exp(-self.tau_d * self.rng.standard_normal()))
         individual[self._id_p] = handle_box_constraint(P, 1. / (3. * self.N_d), 0.5)
 
-        idx, = np.nonzero(rand(self.N_d) < P)
+        idx, = np.nonzero(self.rng.random(self.N_d) < P)
         for i in idx:
             levels = self.bounds_d[i]
-            individual[self.id_d[i]] = levels[randint(0, len(levels))]
+            individual[self.id_d[i]] = levels[self.rng.integers(0, len(levels))]
 
     def stop(self):
         if self.eval_count >= self.max_eval:
@@ -326,7 +332,7 @@ class MIES:
     def optimize(self):
         while not self.stop():
             for i in range(self.lambda_):
-                p1, p2 = randint(0, self.mu_), randint(0, self.mu_)
+                p1, p2 = self.rng.integers(0, self.mu_), self.rng.integers(0, self.mu_)
                 individual = self.recombine(p1, p2)
                 self.offspring[i] = self.mutate(individual)
             
@@ -360,7 +366,7 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
         lambda_: int = 10,
         max_eval: Optional[int] = None,
         elitism: bool = False,
-        random_seed: Optional[int] = None,
+        random_state: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -368,13 +374,17 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
             lambda_: Number of offspring generated per generation.
             max_eval: Maximum number of acquisition function evaluations. Defaults to 500 * dim.
             elitism: Whether to use plus-selection (elitism) or comma-selection.
-            random_seed: RNG seed for reproducibility.
+            random_state: Seed for this instance's own RNG, consumed once at
+                construction to build ``self.rng``. A single run-level starting
+                point: it is not reapplied on later calls, so randomness still
+                evolves across trials/restarts instead of repeating.
         """
         self.mu_ = mu_
         self.lambda_ = lambda_
         self.max_eval = max_eval
         self.elitism = elitism
-        self.random_seed = random_seed
+        self.random_state = random_state
+        self.rng = np.random.default_rng(random_state)
 
     def optimize(
         self,
@@ -399,9 +409,6 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
         """
         if not candidates:
             raise ValueError("candidates must not be empty.")
-
-        if self.random_seed is not None:
-            np.random.seed(self.random_seed)
 
         # Score candidates to find the best initial population
         acq_candidates = predict_fn(candidates)
@@ -450,6 +457,7 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
             search_space=search_space,
             obj_func=obj_func,
             x0_pop=x0_pop,
+            rng=self.rng,
             max_eval=max_eval,
             minimize=True,  # predict_fn is always lower-is-better
             elitism=self.elitism,
