@@ -41,12 +41,12 @@ class DtACI:
         self.gamma_values = np.asarray(gamma_values)
         self.alpha_t_candidates = np.array([alpha] * self.k)
 
-        # Parameters for update mechanics
+        # Parameters for update mechanics.
         self.interval = 50
         self.sigma = 1 / (2 * self.interval)
-        self.eta = (
-            np.sqrt(3 / self.interval)
-            * np.sqrt(np.log(self.interval * self.k) + 2)
+        self.eta = np.sqrt(
+            (3 / self.interval)
+            * (np.log(2 * self.interval * self.k) + 1)
             / ((1 - alpha) ** 2 * alpha**2)
         )
 

@@ -65,9 +65,7 @@ class QuantileConformalSearcher:
         sampler: Sampler,
         n_pre_conformal_trials: int = 32,
         n_calibration_folds: int = 3,
-        calibration_split_strategy: Literal[
-            "cv", "train_test_split", "adaptive"
-        ] = "adaptive",
+        calibration_split_strategy: Literal["cv", "train_test_split"] = "cv",
     ) -> None:
         """
         Args:
@@ -80,8 +78,7 @@ class QuantileConformalSearcher:
             n_pre_conformal_trials: Minimum total samples required for conformal mode.
                 Below this threshold, direct quantile predictions are used.
             n_calibration_folds: Number of folds for cross-validation calibration.
-            calibration_split_strategy: One of ``"cv"``, ``"train_test_split"``,
-                or ``"adaptive"``.
+            calibration_split_strategy: One of ``"cv"`` or ``"train_test_split"``.
         """
         self.sampler = sampler
         self.quantile_estimator_architecture = quantile_estimator_architecture

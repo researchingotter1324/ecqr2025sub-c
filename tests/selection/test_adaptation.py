@@ -310,10 +310,10 @@ def test_dtaci_initialization_parameters(alpha):
     """Test DtACI initializes with correct theoretical parameters."""
     dtaci = DtACI(alpha=alpha)
 
-    # Check theoretical parameter formulas
-    expected_eta = (
-        np.sqrt(3 / dtaci.interval)
-        * np.sqrt(np.log(dtaci.interval * dtaci.k) + 2)
+    # Check theoretical parameter formulas (Gibbs & Candes 2024, Section 3.1)
+    expected_eta = np.sqrt(
+        (3 / dtaci.interval)
+        * (np.log(2 * dtaci.interval * dtaci.k) + 1)
         / ((1 - alpha) ** 2 * alpha**2)
     )
     expected_sigma = 1 / (2 * dtaci.interval)
