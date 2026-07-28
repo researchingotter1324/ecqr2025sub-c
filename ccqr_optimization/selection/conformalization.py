@@ -78,7 +78,7 @@ class QuantileConformalEstimator:
         quantile_estimator_architecture: str,
         alphas: List[float],
         n_pre_conformal_trials: int = 32,
-        n_calibration_folds: int = 3,
+        n_calibration_folds: int = 5,
         calibration_split_strategy: Literal["cv", "train_test_split"] = "cv",
         normalize_features: bool = True,
     ):
@@ -467,18 +467,17 @@ class QuantileConformalEstimator:
     ) -> Tuple[np.ndarray, np.ndarray, int]:
         """Build the pooled CV+ calibration arrays for one alpha level.
 
-        For every held-out calibration point across every fold, pairs that
-        point's own fold estimator's prediction at ``X_processed`` with that
-        same point's nonconformity score to form the ``lower_value``/
-        ``upper_value`` arrays whose quantiles define the served interval
-        Ĉ_t(·) (Barber et al. CV+ construction). This reduces exactly to
-        standard split conformal when there is a single fold.
+        For every held-out calibration point i across every fold k(i), pairs
+        that point's fold estimator prediction at ``X_processed`` with that
+        point's nonconformity score D_i to produce:
 
-        This is the single source of truth for Ĉ_t(·): both ``predict_intervals``
-        (which takes a quantile of these arrays at a specific alpha) and
-        ``calculate_betas`` (which inverts these arrays to find beta_t for an
-        observed y) must build them identically, otherwise the beta feedback
-        driving DtACI/ACI would not correspond to the interval actually served.
+            lower_values[i, j] = Q̂^{-S_{k(i)}}_{α/2}(X_j) - D_i  =  L_i(X_j)
+            upper_values[i, j] = Q̂^{-S_{k(i)}}_{1-α/2}(X_j) + D_i =  U_i(X_j)
+
+        ``predict_intervals`` takes order statistics of these arrays to form
+        the served interval. ``calculate_betas`` inverts those same arrays to
+        compute β_t. Both must use this method so that β_t reflects coverage
+        of the interval actually served.
 
         Args:
             X_processed: Already-scaled input features, shape (n_points, n_features).
@@ -531,13 +530,15 @@ class QuantileConformalEstimator:
     ) -> float:
         """Invert beta_t := sup{beta : y_true in C_t(beta)} for a CV+/split set.
 
-        Given ``C_t(beta) = [Quantile(beta/(1+1/n), lower_values),
-        Quantile(1-beta/(1+1/n), upper_values)]`` (the same construction used
-        by ``predict_intervals``), both endpoints are monotone in beta (the
-        interval shrinks as beta grows), so beta_t is found by separately
-        inverting each side's empirical CDF and taking the tighter (min)
-        constraint. This exactly matches the paper's beta_t definition for
-        whichever conformal construction (split or CV+) produced C_t.
+        The interval Ĉ_t(β) is parametrised by the same order-statistic
+        formula used in ``predict_intervals``:
+            L(β) = ⌊β(n+1)⌋-th smallest L_i,   U(β) = ⌈(1-β)(n+1)⌉-th smallest U_i
+
+        Both endpoints are monotone in β (interval shrinks as β grows).
+        The exact discrete inversions are:
+            β_lower* = sup{β : y_true ≥ L(β)} = (#{i: L_i ≤ y_true} + 1) / (n+1)
+            β_upper* = sup{β : y_true ≤ U(β)} = (#{i: U_i ≥ y_true} + 1) / (n+1)
+            β_t = min(β_lower*, β_upper*)
 
         Args:
             lower_values_col: Pooled lower-shifted calibration values for a
@@ -545,22 +546,29 @@ class QuantileConformalEstimator:
             upper_values_col: Pooled upper-shifted calibration values for a
                 single candidate point, shape ``(n_scores,)``.
             y_true: Observed target value.
-            n_scores: Total pooled calibration sample size (matches the
-                finite-sample correction factor used in ``predict_intervals``).
+            n_scores: Total pooled calibration sample size n.
 
         Returns:
             beta_t, clipped to [0, 1].
         """
-        finite_sample_factor = 1 + 1 / n_scores
-        beta_lower = finite_sample_factor * np.mean(lower_values_col <= y_true)
-        beta_upper = finite_sample_factor * np.mean(upper_values_col >= y_true)
+        beta_lower = (np.sum(lower_values_col <= y_true) + 1) / (n_scores + 1)
+        beta_upper = (np.sum(upper_values_col >= y_true) + 1) / (n_scores + 1)
         return float(np.clip(min(beta_lower, beta_upper), 0.0, 1.0))
 
     def predict_intervals(self, X: np.array) -> List[ConformalBounds]:
         """Generate conformal prediction intervals.
 
-        Produces prediction intervals for each alpha level using the fold estimators
-        and nonconformity scores computed during fitting.
+        For CV+ (K folds) with n pooled calibration observations:
+            L̂(X_j) = ⌊α(n+1)⌋-th smallest value among {L_i(X_j)}
+            Û(X_j) = ⌈(1-α)(n+1)⌉-th smallest value among {U_i(X_j)}
+        Out-of-range ranks are interpreted as -∞ and +∞ respectively.
+
+        For SCP (single fold, m calibration observations) this reduces to:
+            L̂(X_j) = Q̂_{α/2}(X_j) - d̂
+            Û(X_j) = Q̂_{1-α/2}(X_j) + d̂
+        where d̂ = ⌈(1-α)(m+1)⌉-th smallest nonconformity score, because
+        L_i = c - D_i is anti-monotone in D_i: ⌊α(m+1)⌋-th smallest L equals
+        c - D_(⌈(1-α)(m+1)⌉) via the identity m+1-⌊x⌋ = ⌈m+1-x⌉.
 
         Args:
             X: Input features for prediction, shape (n_predict, n_features).
@@ -588,21 +596,35 @@ class QuantileConformalEstimator:
             zip(self.alphas, self.updated_alphas)
         ):
             if self.conformalize_predictions:
-                # CV+ method: for each validation point i and corresponding fold k(i),
-                # compute Q̂_{-S_{k(i)}}(x) ± R_i, then take quantiles
+                # CV+ method: build L_i(X_j) and U_i(X_j) across all calibration
+                # points i, then select the appropriate order statistics.
                 lower_values, upper_values, n_scores = (
                     self.build_augmented_calibration_arrays(X_processed, i)
                 )
 
-                quantile_factor = alpha_adjusted / (1 + 1 / n_scores)
-                upper_quantile_factor = (1 - alpha_adjusted) / (1 + 1 / n_scores)
+                # Compute order-statistic ranks per Barber et al. CV+:
+                #   lower rank = ⌊α(n+1)⌋,  upper rank = ⌈(1-α)(n+1)⌉
+                lower_rank = int(np.floor(alpha_adjusted * (n_scores + 1)))
+                upper_rank = int(np.ceil((1 - alpha_adjusted) * (n_scores + 1)))
 
-                lower_interval_bound = np.quantile(
-                    lower_values, quantile_factor, axis=0, method="linear"
-                )
-                upper_interval_bound = np.quantile(
-                    upper_values, upper_quantile_factor, axis=0, method="linear"
-                )
+                # lower_values is shape (n_scores, n_points); sort per prediction point.
+                sorted_lower = np.sort(lower_values, axis=0)
+                sorted_upper = np.sort(upper_values, axis=0)
+
+                # Ranks outside [1, n_scores] resolve to ±∞ (no finite quantile exists).
+                if lower_rank < 1:
+                    lower_interval_bound = np.full(sorted_lower.shape[1], -np.inf)
+                elif lower_rank > n_scores:
+                    lower_interval_bound = np.full(sorted_lower.shape[1], np.inf)
+                else:
+                    lower_interval_bound = sorted_lower[lower_rank - 1, :]
+
+                if upper_rank < 1:
+                    upper_interval_bound = np.full(sorted_upper.shape[1], -np.inf)
+                elif upper_rank > n_scores:
+                    upper_interval_bound = np.full(sorted_upper.shape[1], np.inf)
+                else:
+                    upper_interval_bound = sorted_upper[upper_rank - 1, :]
             else:
                 # Non-conformalized: use first fold estimator (or any single estimator)
                 lower_quantile, upper_quantile = alpha_to_quantiles(alpha)
