@@ -662,15 +662,13 @@ class QuantileConformalEstimator:
         """Calculate empirical coverage feedback (beta values) for adaptation.
 
         For each alpha level, computes ``beta_t := sup{beta : y_true in
-        C_t(beta)}`` against the *exact same* Ĉ_t(·) construction that
-        ``predict_intervals`` uses to serve the interval (shared via
-        ``_build_augmented_calibration_arrays``/``_invert_beta_from_augmented_arrays``).
-        For CV+ this correctly pairs each held-out calibration score with its
-        own fold estimator's prediction (rather than averaging across folds),
-        and for both CV+ and split conformal it applies the same ``n/(n+1)``-style
-        finite-sample correction factor used at prediction time. This guarantees
-        the beta fed into any adapter (e.g. DtACI) reflects the coverage of the
-        interval actually being served, not an approximation of it.
+        C_t(beta)}`` against the same order-statistic interval family used
+        in ``predict_intervals``. For CV+ this pairs each held-out calibration
+        score with its own fold estimator's prediction. For both CV+ and SCP
+        the inversion uses the exact discrete formula
+        ``(#{i: L_i ≤ y_true} + 1) / (n+1)`` and
+        ``(#{i: U_i ≥ y_true} + 1) / (n+1)``, consistent with the
+        ``⌊β(n+1)⌋`` / ``⌈(1-β)(n+1)⌉`` rank selection in ``predict_intervals``.
 
         Args:
             X: Input features for single prediction, shape (n_features,).
