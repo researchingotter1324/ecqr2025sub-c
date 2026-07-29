@@ -561,7 +561,6 @@ class QuantileConformalEstimator:
         For CV+ (K folds) with n pooled calibration observations:
             L̂(X_j) = ⌊α(n+1)⌋-th smallest value among {L_i(X_j)}
             Û(X_j) = ⌈(1-α)(n+1)⌉-th smallest value among {U_i(X_j)}
-        Out-of-range ranks are interpreted as -∞ and +∞ respectively.
 
         For SCP (single fold, m calibration observations) this reduces to:
             L̂(X_j) = Q̂_{α/2}(X_j) - d̂
@@ -569,6 +568,12 @@ class QuantileConformalEstimator:
         where d̂ = ⌈(1-α)(m+1)⌉-th smallest nonconformity score, because
         L_i = c - D_i is anti-monotone in D_i: ⌊α(m+1)⌋-th smallest L equals
         c - D_(⌈(1-α)(m+1)⌉) via the identity m+1-⌊x⌋ = ⌈m+1-x⌉.
+
+        Out-of-range ranks (α < 1/(n+1), which the theory resolves to ±∞) are
+        clamped to rank 1 (lower) and rank n (upper) so that all returned bounds
+        are finite. This occurs when DtACI drives α below the calibration-set
+        resolution threshold, and the widest finite interval representable by
+        the data is the appropriate practical substitute.
 
         Args:
             X: Input features for prediction, shape (n_predict, n_features).
@@ -604,27 +609,18 @@ class QuantileConformalEstimator:
 
                 # Compute order-statistic ranks per Barber et al. CV+:
                 #   lower rank = ⌊α(n+1)⌋,  upper rank = ⌈(1-α)(n+1)⌉
-                lower_rank = int(np.floor(alpha_adjusted * (n_scores + 1)))
-                upper_rank = int(np.ceil((1 - alpha_adjusted) * (n_scores + 1)))
+                # Clamp to [1, n_scores] so bounds are always finite.  The
+                # theoretical ±∞ occurs when α < 1/(n+1); clamping to rank 1 / n
+                # returns the widest finite interval the calibration set supports.
+                lower_rank = int(np.clip(np.floor(alpha_adjusted * (n_scores + 1)), 1, n_scores))
+                upper_rank = int(np.clip(np.ceil((1 - alpha_adjusted) * (n_scores + 1)), 1, n_scores))
 
                 # lower_values is shape (n_scores, n_points); sort per prediction point.
                 sorted_lower = np.sort(lower_values, axis=0)
                 sorted_upper = np.sort(upper_values, axis=0)
 
-                # Ranks outside [1, n_scores] resolve to ±∞ (no finite quantile exists).
-                if lower_rank < 1:
-                    lower_interval_bound = np.full(sorted_lower.shape[1], -np.inf)
-                elif lower_rank > n_scores:
-                    lower_interval_bound = np.full(sorted_lower.shape[1], np.inf)
-                else:
-                    lower_interval_bound = sorted_lower[lower_rank - 1, :]
-
-                if upper_rank < 1:
-                    upper_interval_bound = np.full(sorted_upper.shape[1], -np.inf)
-                elif upper_rank > n_scores:
-                    upper_interval_bound = np.full(sorted_upper.shape[1], np.inf)
-                else:
-                    upper_interval_bound = sorted_upper[upper_rank - 1, :]
+                lower_interval_bound = sorted_lower[lower_rank - 1, :]
+                upper_interval_bound = sorted_upper[upper_rank - 1, :]
             else:
                 # Non-conformalized: use first fold estimator (or any single estimator)
                 lower_quantile, upper_quantile = alpha_to_quantiles(alpha)
