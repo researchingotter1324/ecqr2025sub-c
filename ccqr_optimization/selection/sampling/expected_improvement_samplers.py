@@ -168,6 +168,8 @@ class ExpectedImprovementSampler:
         if np.isinf(self.current_best_value) and self.current_best_value > 0:
             return np.full(all_bounds.shape[0], -np.inf)
 
+        # Local sort for the EI integrand only. Does not rebind conformal pairs
+        # or the DtACI adapter attached to each original alpha index.
         quantile_values = monotone_rearrange(all_bounds)
         quantile_levels = np.linspace(
             1 / (self.n_quantiles + 1), self.n_quantiles / (self.n_quantiles + 1), self.n_quantiles

@@ -96,7 +96,6 @@ class DtACI:
         self.alpha_t_candidates = self.alpha_t_candidates + self.gamma_values * (
             self.alpha - err_indicators
         )
-        self.alpha_t_candidates = np.clip(self.alpha_t_candidates, 0.001, 0.999)
 
         if np.sum(self.weights) > 0:
             normalized_weights = self.weights / np.sum(self.weights)

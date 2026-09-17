@@ -46,7 +46,6 @@ class SimpleACI:
 
         # Simple ACI update from paper: α_{t+1} = α_t + γ(α - err_t)
         self.alpha_t = self.alpha_t + self.gamma * (self.alpha - err_t)
-        self.alpha_t = np.clip(self.alpha_t, 0.001, 0.999)
 
         self.alpha_history.append(self.alpha_t)
         return self.alpha_t
@@ -114,8 +113,8 @@ def run_conformal_performance_test(method, X, y, target_alpha, gamma_values=None
         current_alpha = predictor.update(beta=beta)
         alpha_evolution.append(current_alpha)
 
-        # Check breach
-        quantile = np.quantile(cal_residuals, 1 - current_alpha, method="linear")
+        q = float(np.clip(1 - current_alpha, 0.0, 1.0))
+        quantile = np.quantile(cal_residuals, q, method="linear")
         lower = y_test_pred - quantile
         upper = y_test_pred + quantile
         breach = int(not (lower <= y_test <= upper))
@@ -352,9 +351,7 @@ def test_dtaci_update_weight_normalization(beta, dtaci_instance):
         probabilities = dtaci_instance.weights / weight_sum
         assert abs(np.sum(probabilities) - 1.0) < 1e-10
         assert np.all(probabilities >= 0)
-        # Alpha values should remain in valid range
-        assert np.all(dtaci_instance.alpha_t_candidates > 0)
-        assert np.all(dtaci_instance.alpha_t_candidates < 1)
+        assert np.all(np.isfinite(dtaci_instance.alpha_t_candidates))
 
 
 def test_dtaci_theoretical_weight_updates():
@@ -396,9 +393,29 @@ def test_dtaci_expert_alpha_updates():
     for i, (initial_alpha, gamma) in enumerate(zip(initial_alphas, dtaci.gamma_values)):
         err_indicator = float(beta < initial_alpha)
         expected_alpha = initial_alpha + gamma * (dtaci.alpha - err_indicator)
-        expected_alpha = np.clip(expected_alpha, 0.001, 0.999)
 
         assert abs(dtaci.alpha_t_candidates[i] - expected_alpha) < 1e-12
+
+
+def test_dtaci_experts_are_not_projected_onto_unit_interval():
+    """Unprojected ACI keeps experts in [-γ, 1+γ], not inside (0, 1)."""
+    dtaci_low = DtACI(alpha=0.1, gamma_values=[0.5])
+    seen_below_zero = False
+    for _ in range(5):
+        dtaci_low.update(beta=0.0)
+        if dtaci_low.alpha_t_candidates[0] < 0.0:
+            seen_below_zero = True
+        assert dtaci_low.alpha_t_candidates[0] >= -0.5
+    assert seen_below_zero
+
+    dtaci_high = DtACI(alpha=0.1, gamma_values=[0.5])
+    seen_above_one = False
+    for _ in range(25):
+        dtaci_high.update(beta=1.0)
+        if dtaci_high.alpha_t_candidates[0] > 1.0:
+            seen_above_one = True
+        assert dtaci_high.alpha_t_candidates[0] <= 1.5
+    assert seen_above_one
 
 
 def test_dtaci_both_selection_methods():
@@ -417,8 +434,7 @@ def test_dtaci_both_selection_methods():
         betas = [0.85, 0.92, 0.88, 0.95, 0.80]
         alphas = [dtaci.update(beta=beta) for beta in betas]
 
-        # Both methods should produce valid alphas
-        assert all(0.001 <= alpha <= 0.999 for alpha in alphas)
+        assert all(np.isfinite(alpha) for alpha in alphas)
         # Should show adaptation behavior
         assert len(set(np.round(alphas, 6))) > 1
 
@@ -491,10 +507,8 @@ def test_dtaci_algorithm_behavior():
             # Use a very tight tolerance since weights can get extremely small
             assert not np.allclose(dtaci.weights, prev_weights, atol=1e-20)
 
-        # Verify alpha values are in valid range
-        assert np.all(dtaci.alpha_t_candidates >= 0.001)
-        assert np.all(dtaci.alpha_t_candidates <= 0.999)
-        assert 0.001 <= alpha_t <= 0.999
+        assert np.all(np.isfinite(dtaci.alpha_t_candidates))
+        assert np.isfinite(alpha_t)
 
     # Test algorithm adaptation over time
     alphas_sequence = [dtaci.update(beta=beta) for beta in betas]

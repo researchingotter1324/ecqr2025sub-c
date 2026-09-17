@@ -203,7 +203,9 @@ def test_dtaci_parameter_evolution():
     assert adapter.update_count > 0
     assert len(adapter.alpha_history) > 0
 
+    gamma_max = float(np.max(adapter.gamma_values))
     for alpha_val in adapter.alpha_history:
-        assert 0.001 <= alpha_val <= 0.999
+        assert np.isfinite(alpha_val)
+        assert -gamma_max <= alpha_val <= 1 + gamma_max
 
     assert np.var(adapter.alpha_history) != 0

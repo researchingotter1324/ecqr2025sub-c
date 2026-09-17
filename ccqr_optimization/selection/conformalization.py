@@ -1,7 +1,6 @@
 import logging
 import numpy as np
 from typing import Optional, Tuple, List, Literal
-from ccqr_optimization.utils.math import monotone_rearrange
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from ccqr_optimization.wrapping import ConformalBounds
@@ -569,11 +568,16 @@ class QuantileConformalEstimator:
         L_i = c - D_i is anti-monotone in D_i: ⌊α(m+1)⌋-th smallest L equals
         c - D_(⌈(1-α)(m+1)⌉) via the identity m+1-⌊x⌋ = ⌈m+1-x⌉.
 
-        Out-of-range ranks (α < 1/(n+1), which the theory resolves to ±∞) are
-        clamped to rank 1 (lower) and rank n (upper) so that all returned bounds
-        are finite. This occurs when DtACI drives α below the calibration-set
-        resolution threshold, and the widest finite interval representable by
-        the data is the appropriate practical substitute.
+        Out-of-range ranks (α ∉ (0, 1) or α < 1/(n+1), which the theory
+        resolves to ±∞) are clamped to rank 1 (lower) and rank n (upper) so
+        that all returned bounds are finite. This occurs when DtACI drives α
+        outside the calibration-set resolution, and the widest or tightest
+        finite interval representable by the data is the appropriate practical
+        substitute.
+
+        Each alpha level is returned as its own nested family. Intervals are
+        not jointly rearranged, so DtACI coverage feedback inverts the same
+        pair that was served.
 
         Args:
             X: Input features for prediction, shape (n_predict, n_features).
@@ -636,23 +640,7 @@ class QuantileConformalEstimator:
                 )
             )
 
-        # Apply Chernozhukov monotone rearrangement across all conformalized quantiles.
-        all_bounds = []
-        quantile_levels = []
-        for i, alpha in enumerate(self.alphas):
-            lower_q, upper_q = alpha_to_quantiles(alpha)
-            all_bounds.extend([intervals[i].lower_bounds, intervals[i].upper_bounds])
-            quantile_levels.extend([lower_q, upper_q])
-
-        final_bounds = monotone_rearrange(np.column_stack(all_bounds), quantile_levels)
-
-        return [
-            ConformalBounds(
-                lower_bounds=final_bounds[:, 2 * i],
-                upper_bounds=final_bounds[:, 2 * i + 1],
-            )
-            for i in range(len(self.alphas))
-        ]
+        return intervals
 
     def calculate_betas(self, X: np.array, y_true: float) -> list[float]:
         """Calculate empirical coverage feedback (beta values) for adaptation.
