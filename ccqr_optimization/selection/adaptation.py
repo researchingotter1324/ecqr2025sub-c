@@ -41,8 +41,9 @@ class DtACI:
         self.gamma_values = np.asarray(gamma_values)
         self.alpha_t_candidates = np.array([alpha] * self.k)
 
-        # Parameters for update mechanics.
-        self.interval = 50
+        # Local window |I| from Gibbs & Candès §3.1. User choice; σ and η
+        # follow the theorem plug-in with this |I|.
+        self.interval = 20
         self.sigma = 1 / (2 * self.interval)
         self.eta = np.sqrt(
             (3 / self.interval)
