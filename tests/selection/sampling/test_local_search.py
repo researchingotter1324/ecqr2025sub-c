@@ -46,7 +46,40 @@ def test_smac_pool_is_scored_once_and_additional_evals_respect_cap(
     assert acq == pytest.approx(chosen["x"] + 0.01 * chosen["k"])
 
 
-def test_smac_never_returns_a_historically_sampled_config(local_search_space):
+def test_smac_fills_remaining_eval_budget_when_walks_finish_early(local_search_space):
+    mgr = DynamicConfigurationManager(
+        search_space=local_search_space,
+        n_candidate_configurations=24,
+        random_state=0,
+    )
+    candidates = mgr.get_searchable_configurations()
+    call_sizes = []
+
+    def predict_fn(cfgs):
+        call_sizes.append(len(cfgs))
+        return np.array([cfg["x"] + 0.01 * cfg["k"] for cfg in cfgs])
+
+    max_eval = 20
+    search = SmacLocalSearch(
+        n_acq_starts=1,
+        n_historical_starts=0,
+        n_steps_plateau_walk=1,
+        max_eval=max_eval,
+        num_continuous_neighbors=2,
+        random_state=0,
+    )
+    search.optimize(
+        predict_fn=predict_fn,
+        candidates=candidates,
+        config_manager=mgr,
+        search_space=local_search_space,
+        metric_sign=1,
+    )
+
+    assert call_sizes[0] == len(candidates)
+    assert sum(call_sizes[1:]) == max_eval
+
+
     mgr = DynamicConfigurationManager(
         search_space=local_search_space,
         n_candidate_configurations=24,

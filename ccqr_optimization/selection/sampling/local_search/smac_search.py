@@ -8,6 +8,7 @@ from ccqr_optimization.selection.sampling.local_search.base import (
     AcquisitionScoreCache,
     BaseLocalSearchAlgorithm,
     excluded_config_hashes,
+    fill_remaining_eval_budget,
 )
 from ccqr_optimization.utils.configurations.utils import create_config_hash
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
@@ -24,8 +25,8 @@ Config = Dict
 
 EQ_TOL = 1e-10
 SQRT12 = np.sqrt(12.0)
-DEFAULT_N_ACQ_STARTS = 30
-DEFAULT_N_HISTORICAL_STARTS = 18
+DEFAULT_N_ACQ_STARTS = 10
+DEFAULT_N_HISTORICAL_STARTS = 6
 DEFAULT_N_STEPS_PLATEAU_WALK = 10
 DEFAULT_NUM_CONTINUOUS_NEIGHBORS = 8
 DEFAULT_STDEV = 0.2
@@ -319,6 +320,8 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
                         traj_idx + 1,
                         steps_taken,
                     )
+
+            fill_remaining_eval_budget(cache, search_space, self.rng)
 
         best_config, best_acq = cache.best_novel()
         logger.debug(

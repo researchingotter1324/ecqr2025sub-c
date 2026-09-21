@@ -3,6 +3,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from ccqr_optimization.utils.configurations.sampling import get_tuning_configurations
 from ccqr_optimization.utils.configurations.utils import create_config_hash
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
 from ccqr_optimization.wrapping import ParameterRange
@@ -120,6 +121,53 @@ class AcquisitionScoreCache:
             raise ValueError("No novel configuration has been scored.")
 
         return self.configs[best_hash], best_score
+
+
+def fill_remaining_eval_budget(
+    cache: AcquisitionScoreCache,
+    search_space: Dict[str, ParameterRange],
+    rng: np.random.Generator,
+) -> None:
+    """Use leftover ``max_eval`` on random novel configs not yet in ``cache``.
+
+    Called after local search stops (starts exhausted, plateau, etc.) so the
+    total additional surrogate budget is still spent when possible.
+    """
+    if cache.max_eval is not None:
+        oversample_factor = 4
+        max_empty_rounds = 5
+        empty_rounds = 0
+        keep_filling = True
+
+        while keep_filling and not cache.budget_exhausted():
+            remaining = cache.remaining()
+            if remaining is None or remaining <= 0:
+                keep_filling = False
+            else:
+                batch_size = min(remaining, 256)
+                seed = int(rng.integers(0, 2**31 - 1))
+                proposals = get_tuning_configurations(
+                    parameter_grid=search_space,
+                    n_configurations=batch_size * oversample_factor,
+                    random_state=seed,
+                )
+                to_score: List[Config] = []
+                for cfg in proposals:
+                    if not cache.is_novel(cfg):
+                        continue
+                    if create_config_hash(cfg) in cache.scores:
+                        continue
+                    to_score.append(cfg)
+                    if len(to_score) >= batch_size:
+                        break
+
+                if not to_score:
+                    empty_rounds += 1
+                    if empty_rounds >= max_empty_rounds:
+                        keep_filling = False
+                else:
+                    empty_rounds = 0
+                    cache.score(to_score)
 
 
 class BaseLocalSearchAlgorithm(ABC):

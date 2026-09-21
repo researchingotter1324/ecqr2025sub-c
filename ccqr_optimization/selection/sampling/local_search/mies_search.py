@@ -14,6 +14,7 @@ from ccqr_optimization.selection.sampling.local_search.base import (
     AcquisitionScoreCache,
     BaseLocalSearchAlgorithm,
     excluded_config_hashes,
+    fill_remaining_eval_budget,
 )
 from ccqr_optimization.utils.configurations.utils import create_config_hash
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
@@ -522,6 +523,8 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
             )
 
             mies.optimize()
+
+            fill_remaining_eval_budget(cache, search_space, self.rng)
 
         best_config, best_acq = cache.best_novel()
         logger.debug(
