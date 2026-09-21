@@ -1,11 +1,9 @@
 from typing import Dict, List, Literal, Optional
 
-
 import numpy as np
 
 from ccqr_optimization.selection.conformalization import QuantileConformalEstimator
 from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
-from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.sampling.utils import (
     flatten_conformal_bounds,
     initialize_multi_adapters,
@@ -81,7 +79,7 @@ class ExpectedImprovementSampler:
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
         current_best_value: float = float("inf"),
         target_type: Literal["incumbent", "median"] = "incumbent",
-        local_search: Optional[SmacLocalSearch] = None,
+        local_search: Optional[BaseLocalSearchAlgorithm] = None,
     ) -> None:
         """
         Args:
@@ -201,6 +199,7 @@ class ExpectedImprovementSampler:
         intervals = conformal_estimator.predict_intervals(X)
         ei_scores = self.calculate_expected_improvement(predictions_per_interval=intervals)
         self.ei_score_history.append(-ei_scores)
+
         return ei_scores
 
     def select_next(
@@ -228,9 +227,9 @@ class ExpectedImprovementSampler:
         Returns:
             Selected configuration dict.
         """
-        X = config_manager.tabularize_configs(candidates)
-        scores = self.score(conformal_estimator=conformal_estimator, X=X)
         if self.local_search is None:
+            X = config_manager.tabularize_configs(candidates)
+            scores = self.score(conformal_estimator=conformal_estimator, X=X)
             winner_idx = int(np.argmin(scores))
             optimum = candidates[winner_idx]
             winner_ei = -scores[winner_idx]
@@ -241,18 +240,14 @@ class ExpectedImprovementSampler:
                     X=config_manager.tabularize_configs(cfgs),
                 )
 
-            optimum = self.local_search.optimize(
-                predict_fn=predict_fn,
-                candidates=candidates,
-                config_manager=config_manager,
-                search_space=search_space,
-                metric_sign=metric_sign,
+            optimum, acq = self.local_search.optimize(
+                predict_fn,
+                candidates,
+                config_manager,
+                search_space,
+                metric_sign,
             )
-            winner_score = self.score(
-                conformal_estimator=conformal_estimator,
-                X=config_manager.tabularize_configs([optimum]),
-            )
-            winner_ei = -winner_score[0]
+            winner_ei = -acq
 
         self.last_ei_collapsed = 1 if winner_ei <= _EI_ZERO_THRESHOLD else 0
 

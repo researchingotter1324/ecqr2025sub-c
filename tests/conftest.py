@@ -214,6 +214,15 @@ def dummy_parameter_grid():
 
 
 @pytest.fixture
+def local_search_space():
+    return {
+        "x": FloatRange(min_value=0.0, max_value=1.0),
+        "k": IntRange(min_value=0, max_value=8),
+        "c": CategoricalRange(choices=["a", "b", "c"]),
+    }
+
+
+@pytest.fixture
 def linear_data_drift():
     np.random.seed(42)
     n = 500

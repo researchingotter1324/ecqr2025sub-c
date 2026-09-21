@@ -5,7 +5,6 @@ import numpy as np
 from ccqr_optimization.selection.conformalization import QuantileConformalEstimator
 from ccqr_optimization.selection.estimation import PointEstimator
 from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
-from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.sampling.utils import (
     initialize_single_adapter,
     update_single_interval_width,
@@ -25,7 +24,7 @@ class PessimisticLowerBoundSampler:
         self,
         interval_width: float = 0.8,
         adapter: Optional[Literal["DtACI", "ACI"]] = None,
-        local_search: Optional[SmacLocalSearch] = None,
+        local_search: Optional[BaseLocalSearchAlgorithm] = None,
     ) -> None:
         """
         Args:
@@ -103,9 +102,9 @@ class PessimisticLowerBoundSampler:
         Returns:
             Selected configuration dict.
         """
-        X = config_manager.tabularize_configs(candidates)
-        scores = self.score(conformal_estimator=conformal_estimator, X=X)
         if self.local_search is None:
+            X = config_manager.tabularize_configs(candidates)
+            scores = self.score(conformal_estimator=conformal_estimator, X=X)
             optimum = candidates[int(np.argmin(scores))]
         else:
             def predict_fn(cfgs: List[Dict]) -> np.ndarray:
@@ -114,13 +113,14 @@ class PessimisticLowerBoundSampler:
                     X=config_manager.tabularize_configs(cfgs),
                 )
 
-            optimum = self.local_search.optimize(
-                predict_fn=predict_fn,
-                candidates=candidates,
-                config_manager=config_manager,
-                search_space=search_space,
-                metric_sign=metric_sign,
+            optimum, _ = self.local_search.optimize(
+                predict_fn,
+                candidates,
+                config_manager,
+                search_space,
+                metric_sign,
             )
+
         return optimum
 
 
@@ -145,7 +145,7 @@ class LowerBoundSampler(PessimisticLowerBoundSampler):
         ] = "logarithmic_decay",
         c: float = 1,
         beta_max: float = 10,
-        local_search: Optional[SmacLocalSearch] = None,
+        local_search: Optional[BaseLocalSearchAlgorithm] = None,
     ) -> None:
         """
         Args:
@@ -252,13 +252,13 @@ class LowerBoundSampler(PessimisticLowerBoundSampler):
         Returns:
             Selected configuration dict.
         """
-        X = config_manager.tabularize_configs(candidates)
-        scores = self.score(
-            conformal_estimator=conformal_estimator,
-            X=X,
-            point_estimator=point_estimator,
-        )
         if self.local_search is None:
+            X = config_manager.tabularize_configs(candidates)
+            scores = self.score(
+                conformal_estimator=conformal_estimator,
+                X=X,
+                point_estimator=point_estimator,
+            )
             optimum = candidates[int(np.argmin(scores))]
         else:
             def predict_fn(cfgs: List[Dict]) -> np.ndarray:
@@ -268,11 +268,12 @@ class LowerBoundSampler(PessimisticLowerBoundSampler):
                     point_estimator=point_estimator,
                 )
 
-            optimum = self.local_search.optimize(
-                predict_fn=predict_fn,
-                candidates=candidates,
-                config_manager=config_manager,
-                search_space=search_space,
-                metric_sign=metric_sign,
+            optimum, _ = self.local_search.optimize(
+                predict_fn,
+                candidates,
+                config_manager,
+                search_space,
+                metric_sign,
             )
+
         return optimum

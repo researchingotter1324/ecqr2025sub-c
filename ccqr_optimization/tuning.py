@@ -24,8 +24,6 @@ from ccqr_optimization.selection.acquisition import (
 from ccqr_optimization.selection.sampling.expected_improvement_samplers import (
     ExpectedImprovementSampler,
 )
-from ccqr_optimization.selection.sampling.local_search.mies_search import MiesLocalSearch
-from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
 from ccqr_optimization.selection.estimator_configuration import (
     QRF_NAME,
     QLEAF_NAME,
@@ -33,6 +31,9 @@ from ccqr_optimization.selection.estimator_configuration import (
 )
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_N_CANDIDATES = 3000
+DEFAULT_LOCAL_SEARCH_RANDOM_POOL_SIZE = 2048
 
 
 def stop_search(
@@ -91,7 +92,11 @@ class ConformalTuner:
         search_space: Dictionary mapping parameter names to ParameterRange objects
         minimize: Whether to minimize (True) or maximize (False) the objective function
         n_candidates: Number of candidate configurations to sample from the search space at
-            each iteration of conformal search
+            each iteration of conformal search. With local search enabled this is the total
+            surrogate+acquisition evaluation budget per conformal iteration.
+        local_search_random_pool_size: When the sampler has local search attached, size of
+            the random pool scored before neighbourhood search. The remainder of
+            ``n_candidates`` is the local-search evaluation cap. Ignored without local search.
         warm_starts: Pre-evaluated (configuration, performance) pairs to seed the search
         dynamic_sampling: Whether to dynamically resample configuration candidates at each
             iteration of conformal search
@@ -108,7 +113,8 @@ class ConformalTuner:
         objective_function: callable,
         search_space: Dict[str, ParameterRange],
         minimize: bool = True,
-        n_candidates: int = 3000,
+        n_candidates: int = DEFAULT_N_CANDIDATES,
+        local_search_random_pool_size: int = DEFAULT_LOCAL_SEARCH_RANDOM_POOL_SIZE,
         warm_starts: Optional[List[Tuple[Dict, float]]] = None,
         dynamic_sampling: bool = True,
     ) -> None:
@@ -120,6 +126,7 @@ class ConformalTuner:
         self.metric_sign = 1 if minimize else -1
         self.warm_starts = warm_starts
         self.n_candidates = n_candidates
+        self.local_search_random_pool_size = local_search_random_pool_size
         self.dynamic_sampling = dynamic_sampling
         self.config_manager = None
 
@@ -186,7 +193,11 @@ class ConformalTuner:
             )
             self.study.append_trial(trial)
 
-    def initialize_tuning_resources(self, random_state: Optional[int] = None) -> None:
+    def initialize_tuning_resources(
+        self,
+        random_pool_size: int,
+        random_state: Optional[int] = None,
+    ) -> None:
         """Initialize core optimization components and data structures.
 
         Sets up the study container for trial tracking, configuration manager for
@@ -195,28 +206,47 @@ class ConformalTuner:
         maximum performance.
 
         Args:
+            random_pool_size: How many random configurations the manager should
+                hold as the candidate pool each conformal iteration.
             random_state: Random seed for reproducible configuration sampling.
         """
         self.study = Study(
             metric_optimization="minimize" if self.minimize else "maximize"
         )
 
-        # Instantiate appropriate configuration manager based on dynamic_sampling setting
         if self.dynamic_sampling:
             self.config_manager = DynamicConfigurationManager(
                 search_space=self.search_space,
-                n_candidate_configurations=self.n_candidates,
+                n_candidate_configurations=random_pool_size,
                 random_state=random_state,
             )
         else:
             self.config_manager = StaticConfigurationManager(
                 search_space=self.search_space,
-                n_candidate_configurations=self.n_candidates,
+                n_candidate_configurations=random_pool_size,
                 random_state=random_state,
             )
 
         if self.warm_starts:
             self.process_warm_starts()
+
+    def prepare_local_search(self, searcher: QuantileConformalSearcher) -> int:
+        """Return the random-pool size and, if needed, set the local-search eval cap.
+
+        Without local search this is ``n_candidates``. With it, the pool is
+        ``min(local_search_random_pool_size, n_candidates)`` and
+        ``local_search.max_eval`` receives the remainder (or 0).
+        """
+        local_search = getattr(searcher.sampler, "local_search", None)
+        if local_search is None:
+            random_pool_size = self.n_candidates
+        else:
+            random_pool_size = min(
+                self.local_search_random_pool_size, self.n_candidates
+            )
+            local_search.max_eval = max(0, self.n_candidates - random_pool_size)
+
+        return random_pool_size
 
     def evaluate_configuration(self, configuration: Dict) -> Tuple[float, float]:
         """Evaluate a configuration and measure execution time.
@@ -646,16 +676,20 @@ class ConformalTuner:
         quantification to select promising configurations.
 
         When the searcher's sampler has local search enabled, the candidate pool
-        per conformal iteration is automatically capped to 2048 and the remainder
-        of ``n_candidates`` (i.e. ``n_candidates - 2048``) is allocated as the
-        per-iteration local search evaluation budget.  If ``n_candidates`` is at
-        most 2048 the full pool is used and no local search budget is imposed.
+        per conformal iteration is capped to ``local_search_random_pool_size``
+        (default 2048) and the remainder of ``n_candidates`` is allocated as the
+        per-iteration local search evaluation budget. One scored configuration
+        counts as one evaluation; a batch of k costs k. Plateau walks and
+        exhausted start lists may stop local search earlier; the evaluation
+        budget is a higher-level cap. If ``n_candidates`` is at most
+        ``local_search_random_pool_size`` the full pool is used and no local
+        search evaluation budget is imposed.
 
         Local search is configured on the sampler via the ``local_search``
-        parameter. Pass a ``SmacLocalSearch`` instance. Local search algorithms
-        seed their own RNG from an optional ``random_state`` given at
-        construction (independent of this method's ``random_state``); pass it
-        explicitly for reproducible local search::
+        parameter. Pass a ``SmacLocalSearch`` or ``MiesLocalSearch`` instance.
+        Local search algorithms seed their own RNG from an optional
+        ``random_state`` given at construction (independent of this method's
+        ``random_state``); pass it explicitly for reproducible local search::
 
             from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
             from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
@@ -727,15 +761,11 @@ class ConformalTuner:
                 ),
             )
 
-        local_search = getattr(searcher.sampler, "local_search", None)
-        if local_search is not None:
-            local_search_budget = max(0, self.n_candidates - 2048)
-            if isinstance(local_search, SmacLocalSearch):
-                local_search.max_steps = local_search_budget
-            elif isinstance(local_search, MiesLocalSearch):
-                local_search.max_eval = local_search_budget
-
-        self.initialize_tuning_resources(random_state=random_state)
+        random_pool_size = self.prepare_local_search(searcher)
+        self.initialize_tuning_resources(
+            random_pool_size=random_pool_size,
+            random_state=random_state,
+        )
         self.search_timer = RuntimeTracker()
 
         n_warm_starts = len(self.warm_starts) if self.warm_starts else 0

@@ -10,7 +10,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 from numpy import exp, ceil, zeros, mod
 
-from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
+from ccqr_optimization.selection.sampling.local_search.base import (
+    AcquisitionScoreCache,
+    BaseLocalSearchAlgorithm,
+    excluded_config_hashes,
+)
+from ccqr_optimization.utils.configurations.utils import create_config_hash
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
 from ccqr_optimization.wrapping import (
     CategoricalRange,
@@ -22,6 +27,10 @@ from ccqr_optimization.wrapping import (
 logger = logging.getLogger(__name__)
 
 Config = Dict
+
+DEFAULT_MIES_MU = 4
+DEFAULT_MIES_LAMBDA = 10
+MIES_EVALS_PER_DIMENSION = 500
 
 
 def handle_box_constraint(x, lb, ub):
@@ -72,7 +81,7 @@ class MIES:
     def __init__(self, search_space: Dict[str, ParameterRange], obj_func: Callable, 
                  x0_pop: np.ndarray, rng: np.random.Generator, ftarget=None, max_eval=np.inf,
                  minimize=True, elitism=False, mu_=4, lambda_=10, sigma0=None, eta0=None,
-                 P0=None, verbose=False):
+                 P0=None, verbose=False, eval_count_getter: Optional[Callable[[], int]] = None):
 
         self.mu_ = mu_
         self.lambda_ = lambda_
@@ -86,6 +95,7 @@ class MIES:
         self.ftarget = ftarget
         self.elitism = elitism
         self.rng = rng
+        self.eval_count_getter = eval_count_getter
         
         self.var_names = list(search_space.keys())
         
@@ -240,12 +250,14 @@ class MIES:
     def evaluate(self, pop):
         if len(pop.shape) == 1:
             fitness = np.asarray([self.obj_func(pop[self._id_var])])
-            self.eval_count += 1
+            n = 1
         else:
-            # Batch evaluation
             fitness = np.asarray(self.obj_func(pop[:, self._id_var]))
-            self.eval_count += len(pop)
-        
+            n = len(pop)
+        if self.eval_count_getter is not None:
+            self.eval_count = self.eval_count_getter()
+        else:
+            self.eval_count += n
         return fitness
 
     def mutate(self, individual):
@@ -362,8 +374,8 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
 
     def __init__(
         self,
-        mu_: int = 4,
-        lambda_: int = 10,
+        mu_: int = DEFAULT_MIES_MU,
+        lambda_: int = DEFAULT_MIES_LAMBDA,
         max_eval: Optional[int] = None,
         elitism: bool = False,
         random_state: Optional[int] = None,
@@ -372,7 +384,10 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
         Args:
             mu_: Population size (number of parents).
             lambda_: Number of offspring generated per generation.
-            max_eval: Maximum number of acquisition function evaluations. Defaults to 500 * dim.
+            max_eval: Cap on additional surrogate+acquisition evaluations after
+                the random candidate pool has been scored. One config = one unit.
+                ``None`` defaults to ``500 * dim``. A value of 0 skips the
+                evolutionary search and returns the best pool config.
             elitism: Whether to use plus-selection (elitism) or comma-selection.
             random_state: Seed for this instance's own RNG, consumed once at
                 construction to build ``self.rng``. A single run-level starting
@@ -393,7 +408,7 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
         config_manager: BaseConfigurationManager,
         search_space: Dict[str, ParameterRange],
         metric_sign: int,
-    ) -> Config:
+    ) -> Tuple[Config, float]:
         """Run MIES local search and return the best configuration found.
 
         Args:
@@ -405,70 +420,114 @@ class MiesLocalSearch(BaseLocalSearchAlgorithm):
             metric_sign: ``+1`` for minimization, ``-1`` for maximization.
 
         Returns:
-            Config with the lowest acquisition value found.
+            The novel configuration with the lowest acquisition value among the
+            random pool and all locally scored offspring.
         """
         if not candidates:
             raise ValueError("candidates must not be empty.")
 
-        # Score candidates to find the best initial population
-        acq_candidates = predict_fn(candidates)
-        sorted_idx = np.argsort(acq_candidates)
-        
-        # Select top mu_ candidates for initial population
-        mu_actual = min(self.mu_, len(candidates))
-        top_candidates = [candidates[i] for i in sorted_idx[:mu_actual]]
-        
-        # If candidates < mu_, pad by repeating the best ones
-        while len(top_candidates) < self.mu_:
-            top_candidates.append(top_candidates[0])
-            
-        var_names = list(search_space.keys())
-        
-        def dict_to_array(config: Config) -> np.ndarray:
-            return np.array([config[name] for name in var_names], dtype=object)
-            
-        def array_to_dict(arr: np.ndarray) -> Config:
-            config = {}
-            for i, name in enumerate(var_names):
-                val = arr[i]
-                p = search_space[name]
-                if isinstance(p, FloatRange):
-                    config[name] = float(val)
-                elif isinstance(p, IntRange):
-                    config[name] = int(val)
+        cache = AcquisitionScoreCache(
+            predict_fn=predict_fn,
+            excluded_hashes=excluded_config_hashes(config_manager),
+            max_eval=self.max_eval
+            if self.max_eval is not None
+            else MIES_EVALS_PER_DIMENSION * len(search_space),
+        )
+        acq_candidates = cache.score_pool(candidates)
+
+        if cache.max_eval is None or cache.max_eval > 0:
+            sorted_idx = np.argsort(acq_candidates)
+            mu_actual = min(self.mu_, len(candidates))
+            top_candidates = [candidates[i] for i in sorted_idx[:mu_actual]]
+            while len(top_candidates) < self.mu_:
+                top_candidates.append(top_candidates[0])
+
+            var_names = list(search_space.keys())
+
+            def dict_to_array(config: Config) -> np.ndarray:
+                return np.array([config[name] for name in var_names], dtype=object)
+
+            def array_to_dict(arr: np.ndarray) -> Config:
+                config = {}
+                for i, name in enumerate(var_names):
+                    val = arr[i]
+                    p = search_space[name]
+                    if isinstance(p, FloatRange):
+                        config[name] = float(val)
+                    elif isinstance(p, IntRange):
+                        config[name] = int(val)
+                    else:
+                        config[name] = val
+                return config
+
+            x0_pop = np.array([dict_to_array(c) for c in top_candidates], dtype=object)
+
+            def score_population(cfgs: List[Config]) -> np.ndarray:
+                out = np.empty(len(cfgs))
+                to_score: List[Config] = []
+                to_score_i: List[int] = []
+                for i, cfg in enumerate(cfgs):
+                    cfg_hash = create_config_hash(cfg)
+                    if not cache.is_novel(cfg):
+                        out[i] = np.inf
+                        continue
+                    cached = cache.scores.get(cfg_hash)
+                    if cached is not None:
+                        out[i] = cached
+                        continue
+                    to_score.append(cfg)
+                    to_score_i.append(i)
+
+                remaining = cache.remaining()
+                if remaining is not None and remaining <= 0:
+                    for i in to_score_i:
+                        out[i] = np.inf
                 else:
-                    config[name] = val
-            return config
+                    if remaining is not None and len(to_score) > remaining:
+                        for i in to_score_i[remaining:]:
+                            out[i] = np.inf
+                        to_score = to_score[:remaining]
+                        to_score_i = to_score_i[:remaining]
+                    if to_score:
+                        new_scores = cache.score(to_score)
+                        for i, score in zip(to_score_i, new_scores):
+                            out[i] = score
 
-        x0_pop = np.array([dict_to_array(c) for c in top_candidates], dtype=object)
+                return out
 
-        def obj_func(pop_arrays: np.ndarray):
-            # pop_arrays is 2D array of shape (N, dim) or 1D array of shape (dim,)
-            if len(pop_arrays.shape) == 1:
-                cfgs = [array_to_dict(pop_arrays)]
-                return float(predict_fn(cfgs)[0])
-            else:
-                cfgs = [array_to_dict(row) for row in pop_arrays]
-                return predict_fn(cfgs)
+            def obj_func(pop_arrays: np.ndarray):
+                if len(pop_arrays.shape) == 1:
+                    scores = score_population([array_to_dict(pop_arrays)])
+                    result = float(scores[0])
+                else:
+                    cfgs = [array_to_dict(row) for row in pop_arrays]
+                    result = score_population(cfgs)
 
-        max_eval = self.max_eval if self.max_eval is not None else 500 * len(search_space)
+                return result
 
-        mies = MIES(
-            search_space=search_space,
-            obj_func=obj_func,
-            x0_pop=x0_pop,
-            rng=self.rng,
-            max_eval=max_eval,
-            minimize=True,  # predict_fn is always lower-is-better
-            elitism=self.elitism,
-            mu_=self.mu_,
-            lambda_=self.lambda_,
-            verbose=False
+            max_eval = cache.max_eval
+
+            mies = MIES(
+                search_space=search_space,
+                obj_func=obj_func,
+                x0_pop=x0_pop,
+                rng=self.rng,
+                max_eval=max_eval,
+                minimize=True,
+                elitism=self.elitism,
+                mu_=self.mu_,
+                lambda_=self.lambda_,
+                verbose=False,
+                eval_count_getter=lambda: cache.n_eval,
+            )
+
+            mies.optimize()
+
+        best_config, best_acq = cache.best_novel()
+        logger.debug(
+            "MIES LS: Done. Best acq = %.6f after %d additional evals.",
+            best_acq,
+            cache.n_eval,
         )
 
-        xopt_list, fopt, stop_dict = mies.optimize()
-        
-        logger.debug("MIES LS: Done. Best acq = %.6f. Stop criteria: %s", fopt, stop_dict)
-        
-        best_config = array_to_dict(xopt_list)
-        return best_config
+        return best_config, best_acq

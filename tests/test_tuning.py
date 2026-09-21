@@ -9,6 +9,7 @@ from ccqr_optimization.utils.tracking import RuntimeTracker
 from ccqr_optimization.selection.acquisition import QuantileConformalSearcher
 from ccqr_optimization.selection.sampling.bound_samplers import LowerBoundSampler
 from ccqr_optimization.selection.sampling.local_search.smac_search import SmacLocalSearch
+from ccqr_optimization.selection.sampling.local_search.mies_search import MiesLocalSearch
 
 
 def test_stop_search_no_remaining_configurations():
@@ -115,7 +116,7 @@ def test_random_search_with_warm_start(
         warm_starts=warm_start_configs,
     )
 
-    tuner.initialize_tuning_resources()
+    tuner.initialize_tuning_resources(random_pool_size=tuner.n_candidates)
     tuner.search_timer = RuntimeTracker()
 
     assert len(tuner.study.trials) == 1
@@ -141,7 +142,7 @@ def test_random_search_with_nan_performance(dummy_parameter_grid):
         minimize=True,
     )
 
-    tuner.initialize_tuning_resources()
+    tuner.initialize_tuning_resources(random_pool_size=tuner.n_candidates)
     tuner.search_timer = RuntimeTracker()
 
     tuner.random_search(
@@ -325,7 +326,7 @@ def test_best_fetcher_methods(minimize):
         minimize=minimize,
         n_candidates=100,
     )
-    tuner.initialize_tuning_resources()
+    tuner.initialize_tuning_resources(random_pool_size=tuner.n_candidates)
     tuner.search_timer = RuntimeTracker()
 
     total_configs = len(list(product([0, 1], [0, 1, 2])))
@@ -343,3 +344,68 @@ def test_best_fetcher_methods(minimize):
 
     assert best_config == expected_config
     assert best_value == expected_value
+
+
+@pytest.mark.parametrize("ls_cls", [SmacLocalSearch, MiesLocalSearch])
+@pytest.mark.parametrize("n_candidates", [100, 2048, 10000])
+def test_tune_local_search_caps_pool_and_sets_eval_budget(
+    dummy_parameter_grid, ls_cls, n_candidates
+):
+    def objective(configuration: Dict) -> float:
+        return float(configuration["param_1"])
+
+    local_search = ls_cls(random_state=0)
+    searcher = QuantileConformalSearcher(
+        quantile_estimator_architecture="ql",
+        sampler=LowerBoundSampler(local_search=local_search),
+        n_pre_conformal_trials=5,
+    )
+    tuner = ConformalTuner(
+        objective_function=objective,
+        search_space=dummy_parameter_grid,
+        minimize=True,
+        n_candidates=n_candidates,
+        dynamic_sampling=True,
+    )
+    tuner.tune(
+        searcher=searcher,
+        n_random_searches=1,
+        max_searches=1,
+        verbose=False,
+        random_state=0,
+    )
+
+    expected_pool = min(tuner.local_search_random_pool_size, n_candidates)
+    assert tuner.config_manager.n_candidate_configurations == expected_pool
+    assert local_search.max_eval == max(
+        0, n_candidates - tuner.local_search_random_pool_size
+    )
+
+
+def test_tune_without_local_search_keeps_full_candidate_pool(dummy_parameter_grid):
+    def objective(configuration: Dict) -> float:
+        return float(configuration["param_1"])
+
+    n_candidates = 500
+    searcher = QuantileConformalSearcher(
+        quantile_estimator_architecture="ql",
+        sampler=LowerBoundSampler(),
+        n_pre_conformal_trials=5,
+    )
+    tuner = ConformalTuner(
+        objective_function=objective,
+        search_space=dummy_parameter_grid,
+        minimize=True,
+        n_candidates=n_candidates,
+        dynamic_sampling=True,
+    )
+    tuner.tune(
+        searcher=searcher,
+        n_random_searches=1,
+        max_searches=1,
+        verbose=False,
+        random_state=0,
+    )
+
+    assert tuner.config_manager.n_candidate_configurations == n_candidates
+    assert getattr(searcher.sampler, "local_search", None) is None

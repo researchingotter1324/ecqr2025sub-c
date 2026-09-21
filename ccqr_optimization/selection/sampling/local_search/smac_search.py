@@ -4,7 +4,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ccqr_optimization.selection.sampling.local_search.base import BaseLocalSearchAlgorithm
+from ccqr_optimization.selection.sampling.local_search.base import (
+    AcquisitionScoreCache,
+    BaseLocalSearchAlgorithm,
+    excluded_config_hashes,
+)
+from ccqr_optimization.utils.configurations.utils import create_config_hash
 from ccqr_optimization.utils.tracking import BaseConfigurationManager
 from ccqr_optimization.wrapping import (
     CategoricalRange,
@@ -19,6 +24,14 @@ Config = Dict
 
 EQ_TOL = 1e-10
 SQRT12 = np.sqrt(12.0)
+DEFAULT_N_ACQ_STARTS = 30
+DEFAULT_N_HISTORICAL_STARTS = 18
+DEFAULT_N_STEPS_PLATEAU_WALK = 10
+DEFAULT_NUM_CONTINUOUS_NEIGHBORS = 8
+DEFAULT_STDEV = 0.2
+DEFAULT_VECTORIZATION_MIN_OBTAIN = 2
+DEFAULT_VECTORIZATION_MAX_OBTAIN = 64
+
 
 def natural_scales(space: Dict[str, ParameterRange]) -> Dict[str, float]:
     """Exact uninformative perturbation scale per non-categorical parameter.
@@ -149,18 +162,31 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
     Attributes:
         n_acq_starts: Start points drawn from the scored candidate pool (top by
             acquisition value). Corresponds to ``local_search_iterations`` in SMAC.
+            Defaults high enough that, together with historical starts, walks
+            typically continue until ``max_eval`` rather than running out of starts.
         n_historical_starts: Start points drawn from the evaluated history (top by
             observed performance, metric_sign-adjusted).
-        n_steps_plateau_walk: Maximum consecutive non-improving rounds before a
-            trajectory terminates. Corresponds to SMAC's ``n_steps_plateau_walk``.
-        max_steps: Hard cap on total neighbourhood-generation rounds across all
-            trajectories. ``None`` means only the plateau counter stops trajectories.
+        n_steps_plateau_walk: Maximum non-improving rounds in a trajectory
+            (cumulative; an improvement does not reset the counter). Saturating
+            this ends the current walk and moves to the next start; it is not a
+            global stop.
+        max_eval: Higher-level cap on additional surrogate+acquisition evaluations
+            after the random pool has been scored. One config = one unit; a batch
+            of k configs costs k. ``None`` means no evaluation cap. Other stops
+            (plateau, exhausted starts, ``max_steps``) may fire earlier.
+        max_steps: Optional cap on total neighbourhood-generation rounds across
+            all trajectories. ``None`` means rounds are limited only by plateau
+            and ``max_eval``.
         num_continuous_neighbors: Gaussian perturbations generated per continuous/
             integer parameter per round. Corresponds to SMAC's ``num_neighbors``.
         stdev: Noise magnitude relative to the parameter's natural scale.
-        vectorization_min_obtain: Minimum neighbours requested at the start of each
-            walk and after a successful improvement.
-        vectorization_max_obtain: Maximum neighbours obtainable per round (doubling cap).
+        vectorization_min_obtain: Neighbours requested at the start of each walk
+            and after a successful improvement. ``obtain_n`` resets to this
+            (hard-coded 2 in the walk, matching SMAC) on improvement.
+        vectorization_max_obtain: Ceiling for ``obtain_n`` after repeated
+            non-improving rounds. Hitting this cap does **not** end the walk;
+            subsequent failures keep requesting this many neighbours until an
+            improvement resets ``obtain_n`` or another stop fires.
         random_state: Seed passed at construction (plain ``int``/``None``, matching
             this codebase's usual convention). ``rng`` is the actual
             ``np.random.Generator`` derived from it once; that instance persists
@@ -170,26 +196,31 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
 
     def __init__(
         self,
-        n_acq_starts: int = 10,
-        n_historical_starts: int = 6,
-        n_steps_plateau_walk: int = 10,
+        n_acq_starts: int = DEFAULT_N_ACQ_STARTS,
+        n_historical_starts: int = DEFAULT_N_HISTORICAL_STARTS,
+        n_steps_plateau_walk: int = DEFAULT_N_STEPS_PLATEAU_WALK,
+        max_eval: Optional[int] = None,
         max_steps: Optional[int] = None,
-        num_continuous_neighbors: int = 8,
-        stdev: float = 0.2,
-        vectorization_min_obtain: int = 2,
-        vectorization_max_obtain: int = 64,
+        num_continuous_neighbors: int = DEFAULT_NUM_CONTINUOUS_NEIGHBORS,
+        stdev: float = DEFAULT_STDEV,
+        vectorization_min_obtain: int = DEFAULT_VECTORIZATION_MIN_OBTAIN,
+        vectorization_max_obtain: int = DEFAULT_VECTORIZATION_MAX_OBTAIN,
         random_state: Optional[int] = None,
     ) -> None:
         """
         Args:
             n_acq_starts: Number of start points from the top of the scored candidate pool.
             n_historical_starts: Number of start points from the evaluated history.
-            n_steps_plateau_walk: Max consecutive non-improving rounds per trajectory.
+            n_steps_plateau_walk: Max non-improving rounds per trajectory (cumulative;
+                success does not reset the counter).
+            max_eval: Cap on additional surrogate+acquisition evaluations after the
+                random pool. ``None`` means no evaluation cap.
             max_steps: Optional global cap on total neighbourhood-generation rounds.
             num_continuous_neighbors: Perturbations per continuous/integer dimension per round.
             stdev: Gaussian noise magnitude relative to the parameter's natural scale.
             vectorization_min_obtain: Batch size at trajectory start and after improvement.
-            vectorization_max_obtain: Maximum batch size (doubles on each non-improving round).
+            vectorization_max_obtain: Ceiling for doubled batch size. Saturating it
+                does not end the walk; ``obtain_n`` stays there until an improvement.
             random_state: Seed for this instance's own RNG, consumed once at
                 construction to build ``self.rng``. A single run-level starting
                 point: it is not reapplied on later calls, so randomness still
@@ -198,6 +229,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         self.n_acq_starts = n_acq_starts
         self.n_historical_starts = n_historical_starts
         self.n_steps_plateau_walk = n_steps_plateau_walk
+        self.max_eval = max_eval
         self.max_steps = max_steps
         self.num_continuous_neighbors = num_continuous_neighbors
         self.stdev = stdev
@@ -213,7 +245,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         config_manager: BaseConfigurationManager,
         search_space: Dict[str, ParameterRange],
         metric_sign: int,
-    ) -> Config:
+    ) -> Tuple[Config, float]:
         """Run SMAC-style neighbourhood search and return the best configuration found.
 
         Args:
@@ -227,7 +259,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             metric_sign: ``+1`` for minimization, ``-1`` for maximization.
 
         Returns:
-            Config with the lowest acquisition value found during the search.
+            ``(config, acquisition)`` for the lowest novel acquisition found.
 
         Raises:
             ValueError: If ``candidates`` is empty.
@@ -236,56 +268,66 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             raise ValueError("candidates must not be empty.")
 
         scales = natural_scales(search_space)
-
-        def predict(cfgs: List[Config]) -> np.ndarray:
-            return np.asarray(predict_fn(cfgs)).flatten()
-
-        acq_candidates = predict(candidates)
+        cache = AcquisitionScoreCache(
+            predict_fn=predict_fn,
+            excluded_hashes=excluded_config_hashes(config_manager),
+            max_eval=self.max_eval,
+        )
+        acq_candidates = cache.score_pool(candidates)
         baseline = float(np.min(acq_candidates))
-        best_config: Config = candidates[int(np.argmin(acq_candidates))]
-        best_acq = baseline
 
         logger.debug(
             "SMAC LS: Scored %d candidates. Baseline acq = %.6f", len(candidates), baseline
         )
 
-        start_points = self.select_starts(
-            candidates, acq_candidates, config_manager, metric_sign, self.rng
-        )
-        if not start_points:
-            logger.warning("SMAC LS: No start points; returning best random candidate.")
-            return best_config
-
-        logger.debug("SMAC LS: %d start points selected.", len(start_points))
-
-        global_steps = 0
-        for traj_idx, start in enumerate(start_points):
-            if self.max_steps is not None and global_steps >= self.max_steps:
-                break
-
-            remaining = (
-                None if self.max_steps is None else self.max_steps - global_steps
-            )
-            found, found_acq, steps_taken = self.walk(
-                predict_fn=predict,
-                start=start,
-                search_space=search_space,
-                scales=scales,
+        start_points: List[Config] = []
+        if self.max_eval is None or self.max_eval > 0:
+            start_points = self.select_starts(
+                candidates=candidates,
+                acq_candidates=acq_candidates,
+                config_manager=config_manager,
+                metric_sign=metric_sign,
                 rng=self.rng,
-                remaining_steps=remaining,
             )
-            global_steps += steps_taken
-
-            if found_acq < best_acq:
-                best_acq, best_config = found_acq, found
-                logger.debug(
-                    "SMAC LS: New best acq = %.6f at trajectory %d.", best_acq, traj_idx + 1
+            if not start_points:
+                logger.warning(
+                    "SMAC LS: No start points; returning best random candidate."
                 )
+            else:
+                logger.debug("SMAC LS: %d start points selected.", len(start_points))
+                global_steps = 0
+                for traj_idx, start in enumerate(start_points):
+                    if cache.budget_exhausted():
+                        break
+                    if self.max_steps is not None and global_steps >= self.max_steps:
+                        break
 
+                    remaining_steps = (
+                        None if self.max_steps is None else self.max_steps - global_steps
+                    )
+                    steps_taken = self.walk(
+                        cache=cache,
+                        start=start,
+                        search_space=search_space,
+                        scales=scales,
+                        rng=self.rng,
+                        remaining_steps=remaining_steps,
+                    )
+                    global_steps += steps_taken
+                    logger.debug(
+                        "SMAC LS: Trajectory %d used %d rounds.",
+                        traj_idx + 1,
+                        steps_taken,
+                    )
+
+        best_config, best_acq = cache.best_novel()
         logger.debug(
-            "SMAC LS: Done. Best acq = %.6f over %d trajectories.", best_acq, len(start_points)
+            "SMAC LS: Done. Best acq = %.6f over %d trajectories.",
+            best_acq,
+            len(start_points),
         )
-        return best_config
+
+        return best_config, best_acq
 
     def select_starts(
         self,
@@ -301,7 +343,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
           - Top ``n_acq_starts`` candidates by acquisition value (ascending).
           - Top ``n_historical_starts`` evaluated configs by signed performance.
 
-        Deduplication by object identity; acquisition-ranked configs appear first.
+        Deduplication by config hash; acquisition-ranked configs appear first.
 
         Args:
             candidates: Candidate pool.
@@ -326,37 +368,45 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             sorted_hist = [hist_configs[i] for i in np.argsort(signed)]
             hist_starts = sorted_hist[: self.n_historical_starts]
 
-        seen_ids = set()
+        seen_hashes = set()
         result: List[Config] = []
-        for c in itertools.chain(acq_starts, hist_starts):
-            cid = id(c)
-            if cid not in seen_ids:
-                seen_ids.add(cid)
-                result.append(c)
+        for cfg in itertools.chain(acq_starts, hist_starts):
+            cfg_hash = create_config_hash(cfg)
+            if cfg_hash not in seen_hashes:
+                seen_hashes.add(cfg_hash)
+                result.append(cfg)
+
         return result
 
     def walk(
         self,
-        predict_fn: Callable[[List[Config]], np.ndarray],
+        cache: AcquisitionScoreCache,
         start: Config,
         search_space: Dict[str, ParameterRange],
         scales: Dict[str, float],
         rng: np.random.Generator,
         remaining_steps: Optional[int],
-    ) -> Tuple[Config, float, int]:
+    ) -> int:
         """Run one neighbourhood-walk trajectory from ``start``.
 
         Implements SMAC's per-trajectory logic:
           - Batch-generate ``obtain_n`` one-exchange neighbours each round.
+          - Drop neighbours that collide with already true-evaluated configs.
+          - Truncate uncached neighbours to the remaining evaluation budget
+            (batch of k costs k).
           - Accept strict improvements immediately; collect ties for plateau walking.
-          - Double ``obtain_n`` on non-improvement (up to vectorization_max_obtain);
-            reset to vectorization_min_obtain on improvement.
-          - Increment plateau counter on each non-improving round; stop at
-            n_steps_plateau_walk.
-          - Honour the optional ``remaining_steps`` hard cap.
+          - Double ``obtain_n`` on non-improvement up to vectorization_max_obtain
+            (default 64). The cap does not end the walk; ``obtain_n`` stays at
+            the cap until an improvement resets it to 2.
+          - Increment plateau counter on each non-improving round (cumulative);
+            stop at n_steps_plateau_walk and return so the next start can run.
+          - Honour the optional ``remaining_steps`` round cap and the evaluation cap.
+
+        Already-searched starts may be used as walk origins; scored neighbours
+        land in ``cache`` and the global winner is the best novel config overall.
 
         Args:
-            predict_fn: Callable that scores a list of configs and returns a flat ndarray.
+            cache: Shared score cache and evaluation budget.
             start: Starting configuration for this trajectory.
             search_space: Search space parameter descriptors.
             scales: Natural scales per non-categorical parameter.
@@ -364,12 +414,11 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             remaining_steps: Maximum rounds allowed for this walk, or None for unlimited.
 
         Returns:
-            Tuple of (best_config, best_acq, steps_taken).
+            Number of neighbourhood-generation rounds taken.
         """
         current = start
-        start_acq = float(predict_fn([current])[0])
+        start_acq = float(self.score_start(cache, current))
         current_acq = start_acq
-        best_config, best_acq = current, current_acq
 
         n_no_plateau = 0
         obtain_n = self.vectorization_min_obtain
@@ -379,11 +428,14 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
         while n_no_plateau < self.n_steps_plateau_walk:
             if remaining_steps is not None and steps_taken >= remaining_steps:
                 break
+            if cache.budget_exhausted():
+                break
 
             neighbors = one_exchange_neighborhood(
                 current, search_space, scales,
                 self.num_continuous_neighbors, self.stdev, rng,
             )
+            neighbors = [n for n in neighbors if cache.is_novel(n)]
             if not neighbors:
                 break
 
@@ -393,9 +445,12 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             else:
                 batch = neighbors
 
-            steps_taken += 1
+            batch = self.trim_batch_to_budget(cache, batch)
+            if not batch:
+                break
 
-            acq_batch = predict_fn(batch)
+            steps_taken += 1
+            acq_batch = cache.score(batch)
 
             improved = False
             for neighbor, nacq in zip(batch, acq_batch):
@@ -403,8 +458,6 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
                 if nacq_f < current_acq - EQ_TOL:
                     current = neighbor
                     current_acq = nacq_f
-                    if nacq_f < best_acq:
-                        best_acq, best_config = nacq_f, neighbor
                     improved = True
                     equal_acq_pool = []
                     break
@@ -414,7 +467,7 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
             # Mirror SMAC post-round obtain_n update:
             # reset to 2 on improvement or empty batch; double (capped) otherwise.
             if obtain_n == 0 or improved:
-                obtain_n = 2
+                obtain_n = self.vectorization_min_obtain
             else:
                 obtain_n = min(obtain_n * 2, self.vectorization_max_obtain)
 
@@ -425,7 +478,47 @@ class SmacLocalSearch(BaseLocalSearchAlgorithm):
                 n_no_plateau += 1
 
         logger.debug(
-            "SMAC walk done: plateau=%d/%d, steps=%d, best_acq=%.6f",
-            n_no_plateau, self.n_steps_plateau_walk, steps_taken, best_acq,
+            "SMAC walk done: plateau=%d/%d, steps=%d",
+            n_no_plateau, self.n_steps_plateau_walk, steps_taken,
         )
-        return best_config, best_acq, steps_taken
+
+        return steps_taken
+
+    def score_start(self, cache: AcquisitionScoreCache, start: Config) -> float:
+        """Return the acquisition of ``start``, consuming budget if uncached.
+
+        If the evaluation budget is exhausted and ``start`` is uncached, skip
+        scoring it and return +inf so the walk cannot treat it as an improvement.
+        """
+        start_hash = create_config_hash(start)
+        cached = cache.scores.get(start_hash)
+        if cached is not None:
+            start_acq = cached
+        elif cache.budget_exhausted():
+            start_acq = np.inf
+        else:
+            start_acq = float(cache.score([start])[0])
+
+        return start_acq
+
+    def trim_batch_to_budget(
+        self,
+        cache: AcquisitionScoreCache,
+        batch: List[Config],
+    ) -> List[Config]:
+        """Keep cached configs and at most ``remaining`` uncached configs."""
+        remaining = cache.remaining()
+        if remaining is None:
+            trimmed = batch
+        else:
+            trimmed = []
+            uncached_kept = 0
+            for cfg in batch:
+                cfg_hash = create_config_hash(cfg)
+                if cfg_hash in cache.scores:
+                    trimmed.append(cfg)
+                elif uncached_kept < remaining:
+                    trimmed.append(cfg)
+                    uncached_kept += 1
+
+        return trimmed
