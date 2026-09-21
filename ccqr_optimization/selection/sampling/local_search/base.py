@@ -123,51 +123,42 @@ class AcquisitionScoreCache:
         return self.configs[best_hash], best_score
 
 
+FILL_BUDGET_SLACK = 256
+
+
 def fill_remaining_eval_budget(
     cache: AcquisitionScoreCache,
     search_space: Dict[str, ParameterRange],
     rng: np.random.Generator,
 ) -> None:
-    """Use leftover ``max_eval`` on random novel configs not yet in ``cache``.
+    """Spend leftover ``max_eval`` in one batched surrogate call when worthwhile.
 
-    Called after local search stops (starts exhausted, plateau, etc.) so the
-    total additional surrogate budget is still spent when possible.
+    Samples up to ``remaining`` novel uncached configs and scores them together.
+    Stops when ``remaining`` is at or below ``FILL_BUDGET_SLACK`` (or 10% of
+    ``max_eval`` if smaller) so the last few units are not chased with extra
+    ``predict_fn`` invocations.
     """
     if cache.max_eval is not None:
-        oversample_factor = 4
-        max_empty_rounds = 5
-        empty_rounds = 0
-        keep_filling = True
+        slack = min(FILL_BUDGET_SLACK, max(1, cache.max_eval // 10))
+        remaining = cache.remaining()
+        if remaining is not None and remaining > slack:
+            proposals = get_tuning_configurations(
+                parameter_grid=search_space,
+                n_configurations=remaining * 2,
+                random_state=int(rng.integers(0, 2**31 - 1)),
+            )
+            to_score: List[Config] = []
+            for cfg in proposals:
+                if not cache.is_novel(cfg):
+                    continue
+                if create_config_hash(cfg) in cache.scores:
+                    continue
+                to_score.append(cfg)
+                if len(to_score) >= remaining:
+                    break
 
-        while keep_filling and not cache.budget_exhausted():
-            remaining = cache.remaining()
-            if remaining is None or remaining <= 0:
-                keep_filling = False
-            else:
-                batch_size = min(remaining, 256)
-                seed = int(rng.integers(0, 2**31 - 1))
-                proposals = get_tuning_configurations(
-                    parameter_grid=search_space,
-                    n_configurations=batch_size * oversample_factor,
-                    random_state=seed,
-                )
-                to_score: List[Config] = []
-                for cfg in proposals:
-                    if not cache.is_novel(cfg):
-                        continue
-                    if create_config_hash(cfg) in cache.scores:
-                        continue
-                    to_score.append(cfg)
-                    if len(to_score) >= batch_size:
-                        break
-
-                if not to_score:
-                    empty_rounds += 1
-                    if empty_rounds >= max_empty_rounds:
-                        keep_filling = False
-                else:
-                    empty_rounds = 0
-                    cache.score(to_score)
+            if to_score:
+                cache.score(to_score)
 
 
 class BaseLocalSearchAlgorithm(ABC):

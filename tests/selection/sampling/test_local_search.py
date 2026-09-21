@@ -77,9 +77,13 @@ def test_smac_fills_remaining_eval_budget_when_walks_finish_early(local_search_s
     )
 
     assert call_sizes[0] == len(candidates)
-    assert sum(call_sizes[1:]) == max_eval
+    additional = sum(call_sizes[1:])
+    assert additional <= max_eval
+    assert additional >= max_eval - 2
+    assert max(call_sizes[1:]) > 5
 
 
+def test_smac_never_returns_a_historically_sampled_config(local_search_space):
     mgr = DynamicConfigurationManager(
         search_space=local_search_space,
         n_candidate_configurations=24,
