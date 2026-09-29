@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccqr_optimization"
+version = "0.0.1"
+description = "Conformal hyperparameter optimization tool"
+readme = "README.md"
+authors = [
+    {name = "anonymous", email = "anonymous@gmail.com"}
+]
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "pandas>=1.3.0",
+    "tqdm>=4.60.0",
+    "pydantic>=2.0.0",
+    "joblib>=1.0.0",
+    "statsmodels>=0.13.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/researchingotter1324/ecqr2025sub-c"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-xdist>=3.0.0",
+    "pre-commit>=3.4.0",
+    "autoflake>=2.0.0",
+]
+docs = [
+    "sphinx>=5.0.0",
+    "sphinx-rtd-theme>=1.3.0",
+    "myst-parser>=2.0.0",
+    "sphinx-copybutton>=0.5.0",
+    "sphinxcontrib-mermaid>=0.8.0",
+]
+
+[tool.setuptools]
+packages = { find = { where = ["."] , include = ["ccqr_optimization*"] } }
+include-package-data = true
